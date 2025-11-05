@@ -1,0 +1,32 @@
+# File: requirements.txt
+
+# Core Chainlit
+chainlit
+
+# Langchain Umbrella Package (sẽ tự kéo core, community, v.v.)
+langchain
+langchain-openai
+langchain-chroma
+
+# Vectorstore DB
+chromadb
+
+# File Processing
+pandas
+openpyxl
+python-docx
+pypdf
+
+# Scheduler & Time
+apscheduler
+SQLAlchemy
+python-dateutil
+pytz
+
+# Utilities
+python-dotenv
+requests
+unidecode
+
+pydantic==2.8.2
+pydantic-core==2.20.1
