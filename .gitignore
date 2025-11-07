@@ -1,5 +1,5 @@
 .venv/
 __pycache__/
-memory_db/
 sessions/
 .env
+# removed memory_db/ so DB folders can be committed as requested
