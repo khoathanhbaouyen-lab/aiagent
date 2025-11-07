@@ -48,7 +48,11 @@ sample_rate = 24000
 [UI]
 # Tên Trợ lý (lấy từ file thứ 2 của bạn)
 name = "Oshima Assistant"
+# Đường dẫn (web path) tới logo trong thư mục /public
+logo = "/public/app_logo.png"
 
+# (Tùy chọn) Favicon cho tab trình duyệt
+favicon = "/public/favicon.ico"
 # Giao diện (lấy từ file thứ 2 của bạn)
 theme = "dark"
 default_collapse_content = true
