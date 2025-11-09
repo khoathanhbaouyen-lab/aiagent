@@ -946,6 +946,97 @@ Output:
         # An toàn: trả về rỗng nếu LLM lỗi
         return []
 
+# (DÁN HÀM MỚI NÀY VÀO KHOẢNG DÒNG 850)
+
+def _llm_filter_for_selection(
+    llm: ChatOpenAI,
+    query: str,
+    candidates: List[dict] # List of {"id": str, "name": str, "note": str, "metadata": dict}
+) -> List[dict]:
+    """(MỚI) Dùng LLM (sync) để lọc KẾT QUẢ TÌM KIẾM (cho file/ảnh)
+    dựa trên query của user, giải quyết nhiễu (ví dụ: query '2024'
+    khớp với 'note' của file '2025').
+    """
+    if not candidates:
+        return []
+        
+    # 1. Tạo danh sách ứng viên (dùng ID làm key)
+    candidate_list_str = "\n".join([
+        f"<item id='{item['id']}'>Tên: {item['name']} | Ghi chú: {item['note']}</item>"
+        for item in candidates
+    ])
+    
+    # 2. Tạo prompt (Theo logic bạn yêu cầu)
+    prompt = f"""Bạn là một bộ lọc thông minh (Smart Filter).
+Nhiệm vụ của bạn là LỌC danh sách (Context) dựa trên Yêu cầu (Query).
+
+Yêu cầu (Query): "{query}"
+
+Danh sách ứng viên (Context):
+{candidate_list_str}
+
+QUY TẮC LỌC:
+1. Đọc kỹ Query.
+2. Chỉ giữ lại những item nào mà PHẦN TÊN (Name) khớp với Query.
+3. BỎ QUA những item chỉ khớp ở PHẦN GHI CHÚ (Note).
+
+VÍ DỤ RẤT QUAN TRỌNG:
+Query: "xem file 2024"
+Context:
+<item id='abc'>Tên: file ns 2024 | Ghi chú: luu file 2024...</item>
+<item id='xyz'>Tên: file ns 2025 | Ghi chú: luu file 2024...</item>
+
+Output (Chỉ trả về ID):
+abc
+
+Query: "luu file"
+Context:
+<item id='abc'>Tên: file ns 2024 | Ghi chú: luu file 2024...</item>
+<item id='xyz'>Tên: file ns 2025 | Ghi chú: luu file 2024...</item>
+
+Output (Chỉ trả về ID):
+abc
+xyz
+
+Query: "file ns 2025"
+Context:
+<item id='abc'>Tên: file ns 2024 | Ghi chú: luu file 2024...</item>
+<item id='xyz'>Tên: file ns 2025 | Ghi chú: luu file 2024...</item>
+
+Output (Chỉ trả về ID):
+xyz
+
+Output (Chỉ trả về các ID, mỗi ID một dòng. KHÔNG GIẢI THÍCH):
+"""
+    
+    try:
+        # 3. Gọi LLM (sync)
+        resp = llm.invoke(prompt)
+        llm_output_text = resp.content.strip()
+        
+        if not llm_output_text:
+            return []
+            
+        # 4. Lọc lại
+        llm_approved_ids = set([line.strip() for line in llm_output_text.split('\n') if line.strip()])
+        
+        final_list = []
+        for candidate in candidates:
+            if candidate['id'] in llm_approved_ids:
+                final_list.append(candidate)
+                
+        print(f"[LLM Filter Selection] Đã lọc {len(candidates)} -> còn {len(final_list)} (Query: '{query}')")
+        return final_list
+        
+    except Exception as e:
+        print(f"❌ Lỗi _llm_filter_for_selection: {e}")
+        # An toàn: trả về danh sách GỐC nếu LLM lỗi
+        print("⚠️ [LLM Filter Selection] Lỗi, trả về danh sách gốc (chưa lọc).")
+        return candidates
+    
+    
+    
+    
 def _find_notes_for_deletion(
     vectorstore: Chroma, 
     llm: ChatOpenAI, 
@@ -1064,32 +1155,79 @@ def _mark_task_complete_db(task_id: int, user_email: str) -> bool:
     
     print(f"[TaskDB] Đã đánh dấu hoàn thành Task ID: {task_id}")
     return updated_rows > 0
-
-def _get_tasks_from_db(user_email: str, status: str = "uncompleted") -> List[dict]:
+# (THAY THẾ HÀM NÀY - khoảng dòng 730)
+def _get_tasks_from_db(
+    user_email: str, 
+    status: str = "uncompleted",
+    start_date: Optional[datetime] = None, 
+    end_date: Optional[datetime] = None   
+) -> List[dict]:
     """
-    (SYNC) Lấy danh sách công việc của user.
+    (SỬA LỖI V94 - SẮP XẾP THEO NGÀY TẠO)
+    Lấy danh sách công việc.
     status: 'uncompleted', 'completed', 'all'
     """
     conn = _get_user_db_conn()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    base_query = "SELECT id, title, description, due_date, recurrence_rule, is_completed FROM user_tasks WHERE user_email = ?"
+    # (Bảng 'user_tasks' đã có 'created_at' (dòng 403))
+    base_query = "SELECT id, title, description, due_date, recurrence_rule, is_completed, created_at FROM user_tasks WHERE user_email = ?"
     params = [user_email.lower()]
     
     if status == "uncompleted":
         base_query += " AND is_completed = 0"
     elif status == "completed":
         base_query += " AND is_completed = 1"
-    # (Nếu là 'all', không thêm gì)
+    
+    if start_date:
+        base_query += " AND due_date >= ?"
+        params.append(start_date)
         
-    base_query += " ORDER BY due_date ASC"
+    if end_date:
+        safe_end_date = end_date.replace(hour=23, minute=59, second=59)
+        base_query += " AND due_date <= ?" 
+        params.append(safe_end_date)
+        
+    # --- 🚀 SỬA LỖI V94 (SẮP XẾP THEO YÊU CẦU CỦA BẠN) 🚀 ---
+    if status == "uncompleted":
+        # CHƯA HOÀN THÀNH: Sắp xếp theo HẠN CHÓT (Cũ nhất lên đầu)
+        base_query += " ORDER BY due_date ASC"
+    else:
+        # ĐÃ HOÀN THÀNH (hoặc ALL): Sắp xếp theo NGÀY TẠO (Mới nhất lên đầu)
+        base_query += " ORDER BY created_at DESC"
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
         
     cursor.execute(base_query, params)
     tasks = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return tasks
 
+def _get_task_status_db(task_id: int) -> bool:
+    """(MỚI) (SYNC) Kiểm tra xem task đã hoàn thành chưa. 
+    Trả về True = Hoàn thành, False = Chưa hoàn thành.
+    """
+    conn = None
+    try:
+        conn = _get_user_db_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_completed FROM user_tasks WHERE id = ?", (task_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            # row[0] là 0 (chưa hoàn thành) hoặc 1 (đã hoàn thành)
+            return row[0] == 1 
+            
+        # Nếu không tìm thấy task (ví dụ: đã bị xóa),
+        # coi như "hoàn thành" để dừng vòng lặp
+        return True 
+        
+    except Exception as e:
+        print(f"❌ Lỗi _get_task_status_db (ID: {task_id}): {e}")
+        if conn: conn.close()
+        return True # An toàn: Lỗi CSDL -> dừng vòng lặp
+    
+    
 # (Dán hàm mới này vào khoảng dòng 472)
 def _delete_task_db(user_email: str, vectorstore: Chroma, query: str) -> int:
     """(SYNC) Tìm và xóa task dựa trên query (ID hoặc nội dung)."""
@@ -1209,24 +1347,41 @@ def _delete_task_db_by_id(task_id: int, user_email: str) -> bool:
     return deleted_rows > 0
 
 # =========================================================
-# 💬 Action Callbacks (UI) - (Bắt đầu từ dòng 2390)
-# =========================================================
-# (Đổi tên hàm và thêm nút Xóa)
-async def ui_show_uncompleted_tasks():
-    """(MỚI) Hiển thị tất cả công việc CHƯA HOÀN THÀNH."""
+# (THAY THẾ HÀM NÀY - khoảng dòng 778)
+async def ui_show_uncompleted_tasks(
+    start_date: Optional[datetime] = None, # <-- MỚI
+    end_date: Optional[datetime] = None,   # <-- MỚI
+    filter_title: str = ""                 # <-- MỚI
+):
+    """(SỬA LỖI) Hiển thị công việc (lọc theo ngày/tiêu đề)."""
     user_id_str = cl.user_session.get("user_id_str")
     if not user_id_str:
         await cl.Message(content="❌ Lỗi: Không tìm thấy user_id_str.").send()
         return
 
-    # Sửa: Gọi hàm CSDL với status='uncompleted'
-    tasks = await asyncio.to_thread(_get_tasks_from_db, user_id_str, status="uncompleted")
+    # Sửa: Gọi hàm CSDL với filters
+    tasks = await asyncio.to_thread(
+        _get_tasks_from_db, 
+        user_id_str, 
+        status="uncompleted",
+        start_date=start_date,
+        end_date=end_date
+    )
     
+    # (MỚI) Xây dựng tiêu đề
+    if filter_title:
+        title = f"📝 **{len(tasks)} công việc chưa hoàn thành (cho '{filter_title}'):**"
+    else:
+         title = f"📝 **Danh sách {len(tasks)} công việc chưa hoàn thành:**"
+
     if not tasks:
-        await cl.Message(content="🎉 Bạn không có công việc nào chưa hoàn thành!").send()
+        if filter_title:
+            await cl.Message(content=f"🎉 Bạn không có công việc nào chưa hoàn thành (cho '{filter_title}')!").send()
+        else:
+            await cl.Message(content="🎉 Bạn không có công việc nào chưa hoàn thành!").send()
         return
 
-    await cl.Message(content=f"📝 **Danh sách {len(tasks)} công việc chưa hoàn thành:**").send()
+    await cl.Message(content=title).send() # <-- SỬA: Dùng title
     
     for task in tasks:
         due_date_str = task['due_date']
@@ -1259,7 +1414,6 @@ async def ui_show_uncompleted_tasks():
         
         msg.actions = actions
         await msg.send()
-        
 # (Dán hàm MỚI này vào khoảng dòng 2440)
 async def ui_show_completed_tasks():
     """(MỚI) Hiển thị tất cả công việc ĐÃ HOÀN THÀNH."""
@@ -1379,12 +1533,61 @@ async def _on_complete_task(action: cl.Action):
 
 
 
-def _push_task_notification(internal_session_id: str, task_title: str, task_id: int):
-    """(SYNC) Hàm này được Scheduler gọi để push thông báo Task."""
-    print(f"[TaskPush] Đang push cho Task ID: {task_id} ({task_title})")
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 865)
+def _push_task_notification(
+    internal_session_id: str, 
+    task_title: str, 
+    task_id: int, 
+    repeat_min: Optional[int] # <-- NHẬN THAM SỐ MỚI
+):
+    """
+    (SỬA LỖI V90) (SYNC) 
+    Hàm này được Scheduler gọi để push thông báo Task.
+    1. Kiểm tra CSDL xem task_id đã hoàn thành chưa.
+    2. Nếu CHƯA:
+       a. Push thông báo.
+       b. Nếu có repeat_min, lên lịch GỌI LẠI CHÍNH HÀM NÀY 
+          sau 'repeat_min' phút.
+    3. Nếu RỒI: Dừng vòng lặp (không làm gì cả).
+    """
+    print(f"[TaskPush] Đang kiểm tra Task ID: {task_id} ({task_title})")
     
-    # Chỉ push, không quản lý leo thang
+    # 1. (MỚI) Kiểm tra CSDL
+    # (Hàm _get_task_status_db đã được thêm ở Bước 1)
+    is_completed = _get_task_status_db(task_id)
+    
+    if is_completed:
+        print(f"[TaskPush] Task ID: {task_id} đã hoàn thành. Dừng vòng lặp nhắc lại.")
+        return # Dừng
+        
+    # 2. (CHƯA HOÀN THÀNH) Push thông báo
+    print(f"[TaskPush] Task ID: {task_id} CHƯA hoàn thành. Đang Push...")
     _do_push(internal_session_id, f"Đến hạn công việc: {task_title}")
+    
+    # 3. (MỚI) Lên lịch kiểm tra lặp lại (nếu có)
+    if repeat_min and repeat_min > 0:
+        if not SCHEDULER:
+            print("[TaskPush] Lỗi: Không tìm thấy SCHEDULER để lặp lại.")
+            return
+            
+        try:
+            next_run_dt = datetime.now(VN_TZ) + timedelta(minutes=repeat_min)
+            new_job_id = f"taskpush-check-{task_id}-{uuid.uuid4().hex[:6]}"
+            
+            print(f"[TaskPush] Đã lên lịch kiểm tra lặp lại cho Task ID: {task_id} sau {repeat_min} phút (Job: {new_job_id})")
+            
+            # Lên lịch gọi lại CHÍNH NÓ (tạo vòng lặp)
+            SCHEDULER.add_job(
+                _push_task_notification, 
+                trigger=DateTrigger(run_date=next_run_dt, timezone=VN_TZ),
+                id=new_job_id,
+                # Truyền lại tất cả tham số
+                args=[internal_session_id, task_title, task_id, repeat_min], 
+                replace_existing=False,
+                misfire_grace_time=60
+            )
+        except Exception as e_sched:
+            print(f"❌ Lỗi khi lên lịch lặp lại cho Task {task_id}: {e_sched}")
 # =========================================================
 # =========================================================
 # 📇 MỚI: Quản lý Từ điển Fact (Fact Dictionary)
@@ -1435,79 +1638,140 @@ def save_user_fact_dict(user_id_str: str, data: dict):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"⚠️ Lỗi lưu fact dict {user_id_str}: {e}")
-
-# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 918)
-async def call_llm_to_classify(llm: ChatOpenAI, question: str, existing_keys: List[str]) -> str:
+# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 1106)
+# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 1106)
+async def call_llm_to_classify(
+    llm: ChatOpenAI, 
+    question: str, 
+    fact_map: dict # <-- SỬA: Nhận toàn bộ fact_map
+) -> Tuple[str, str, str]:
     """
-    (SỬA LỖI 35: PROMPT V29 - SỬA LỖI 'UNKNOWN' - THEO Ý USER)
-    Giải quyết lỗi v27 (ví dụ: 'doanh so 2023' -> 'unknown').
-    Làm rõ QUY TẮC SỐ 3: Bắt buộc LLM phải tạo key mới nếu không khớp,
-    thay vì trả về 'unknown'.
+    (SỬA LỖI V88 - THEO YÊU CẦU CỦA USER)
+    1. Nhận toàn bộ 'fact_map' làm context.
+    2. Yêu cầu GPT ƯU TIÊN TÁI SỬ DỤNG 'Key'/'Label' đã có 
+       thay vì "tạo" (invent) key mới.
     """
     
-    valid_keys = sorted(list(set(k for k in existing_keys if k and isinstance(k, str))))
-    keys_str = ", ".join([f"'{k}'" for k in valid_keys])
-    if not keys_str:
-        keys_str = "(chưa có key nào)"
+    # --- 🚀 BƯỚC 1: XÂY DỰNG CONTEXT TỪ FACT_MAP 🚀 ---
+    existing_facts_str = "Context (Fact) hiện tại:\n(Không có)"
+    try:
+        if fact_map and isinstance(fact_map, dict):
+            existing_facts_list = []
+            seen_keys = set()
+            
+            # Chỉ lấy các key/label duy nhất
+            for data in fact_map.values():
+                if isinstance(data, dict):
+                    key = data.get("key")
+                    label = data.get("label")
+                    if key and key not in seen_keys:
+                        existing_facts_list.append(f"- Key: {key} (Label: {label})")
+                        seen_keys.add(key)
+                elif isinstance(data, str) and data not in seen_keys:
+                    # Fallback cho cache cũ (chỉ lưu string)
+                    label = data.replace("_", " ").title()
+                    existing_facts_list.append(f"- Key: {data} (Label: {label})")
+                    seen_keys.add(data)
+            
+            if existing_facts_list:
+                existing_facts_str = "Context (Fact) hiện tại:\n" + "\n".join(sorted(existing_facts_list))
+    except Exception as e_parse:
+        print(f"⚠️ Lỗi parse fact_map (V88): {e_parse}")
+        existing_facts_str = "Context (Fact) hiện tại:\n(Lỗi parse)"
         
-    # --- 🚀 BẮT ĐẦU PROMPT MỚI (v29) 🚀 ---
+    # --- 🚀 BƯỚC 2: TẠO PROMPT V88 (THEO Ý BẠN) 🚀 ---
     prompt_text = f"""
-    Bạn là một chuyên gia Phân loại Danh mục (Category Classifier).
-    Nhiệm vụ: Tìm 1 'fact_key' CHÍNH XÁC NHẤT cho 'Query' (câu hỏi) dưới đây.
-
+    Bạn là một chuyên gia Phân tích Query (Classifier).
+    
     Query: "{question}"
-    
-    Các Danh mục (fact_key) HIỆN CÓ:
-    [{keys_str}]
 
-    NHIỆM VỤ CỦA BẠN:
+    {existing_facts_str}
 
-    BƯỚC 1: Tạo một 'ideal_key' (danh mục lý tưởng, dạng snake_case)
-    tóm tắt CHUNG NHẤT cho Query.
-    (Ví dụ: "xem ds anh" -> ideal_key: 'anh')
-    (Ví dụ: "doanh so 2023" -> ideal_key: 'doanh_so')
+    NHIỆM VỤ:
+    1. Đọc kỹ Query và Context (Fact) hiện tại.
+    2. ƯU TIÊN 1 (Tái sử dụng): Nếu Query có vẻ thuộc về một "Fact" đã có trong Context, hãy TÁI SỬ DỤNG 'Key' và 'Label' của nó.
+    3. ƯU TIÊN 2 (Tạo mới): Nếu Query không khớp với Context, hãy TẠO MỚI một 'Key' và 'Label' hợp lý.
+    4. Trích xuất 'core_query_term' (từ khóa tìm kiếm chính, đã loại bỏ hành động và danh mục).
 
-    BƯỚC 2: So sánh 'ideal_key' (bạn vừa tạo ở B1) với
-    [Các Danh mục HIỆN CÓ].
-    
-    - TRƯỜNG HỢP 1 (Ưu tiên): Nếu 'ideal_key' (ví dụ: 'anh')
-      là một phần (hoặc rất giống) với một key HIỆN CÓ 
-      (ví dụ: 'anh_du_lich')
-      -> BẠN PHẢI TRẢ VỀ key HIỆN CÓ (ví dụ: 'anh_du_lich').
-      
-    - TRƯỜNG HỢP 2: Nếu 'ideal_key' (ví dụ: 'anh_du_lich')
-      ĐÃ TỒN TẠI trong [Các Danh mục HIỆN CÓ]
-      -> Trả về 'ideal_key' đó (ví dụ: 'anh_du_lich').
-      
-    - TRƯỜNG HỢP 3 (BẮT BUỘC): Nếu 'ideal_key' (ví dụ: 'doanh_so')
-      HOÀN TOÀN KHÁC BIỆT với TẤT CẢ key HIỆN CÓ
-      -> BẠN BẮT BUỘC PHẢI trả về 'ideal_key' MỚI đó (ví dụ: 'doanh_so').
-      
-    QUAN TRỌNG:
-    - KHÔNG BAO GIỜ được trả về 'unknown' hoặc 'general_query' 
-      chỉ vì 'ideal_key' của bạn không nằm trong danh sách HIỆN CÓ.
-    - CHỈ trả về 'general_query' nếu Query quá chung chung (ví dụ: 'xem', 'hi').
-    
-    QUY TẮC TRẢ LỜI:
-    - Chỉ trả về 1 'fact_key' (danh mục)
+    QUY TẮC TRẢ VỀ:
+    - Định dạng: `fact_key | Label Tiếng Việt | core_query_term`
     - KHÔNG GIẢI THÍCH.
+
+    VÍ DỤ TÁI SỬ DỤNG (RẤT QUAN TRỌNG):
+    Query: "xem ảnh phan thiet"
+    Context (Fact) hiện tại:
+    - Key: du_lich (Label: Du Lịch)
+    - Key: cong_viec (Label: Công Việc)
+    (GPT sẽ thấy 'phan thiet' liên quan đến 'du_lich')
+    Output: du_lich | Du Lịch | anh phan thiet
+
+    VÍ DỤ TẠO MỚI:
+    Query: "pass server của tôi"
+    Context (Fact) hiện tại:
+    - Key: du_lich (Label: Du Lịch)
+    (GPT thấy không liên quan)
+    Output: server_thong_tin | Server Thông Tin | pass server
+    
+    VÍ DỤ LỌC (CHUNG):
+    Query: "xem file trong cong viec"
+    Context (Fact) hiện tại:
+    - Key: du_lich (Label: Du Lịch)
+    - Key: cong_viec (Label: Công Việc)
+    (GPT thấy 'cong viec' khớp Context)
+    Output: cong_viec | Công Việc | ALL
+
+    Output (key | label | core_query_term):
     """
-    # --- 🚀 KẾT THÚC PROMPT MỚI 🚀 ---
+    # --- 🚀 KẾT THÚC PROMPT V88 🚀 ---
     
     try:
         resp = await llm.ainvoke(prompt_text)
-        fact_key = resp.content.strip().strip("`'\"").replace(" ", "_")
-        fact_key = re.sub(r"[^a-z0-9_]", "", fact_key.lower())
+        raw_output = resp.content.strip().strip("`'\"")
         
-        if not fact_key:
-            return "general_query"
+        fact_key = "general"
+        fact_label = "General"
+        core_query_term = question
+        
+        if "|" in raw_output:
+            parts = raw_output.split("|")
             
-        print(f"[call_llm_to_classify] (Prompt v29) Query: '{question}' -> Key: '{fact_key}'")
-        return fact_key
+            if len(parts) >= 3:
+                key_part = parts[0].strip().replace(" ", "_")
+                label_part = parts[1].strip()
+                name_part = parts[2].strip()
+                
+                if key_part: fact_key = re.sub(r"[^a-z0-9_]", "", key_part.lower())
+                if label_part: fact_label = label_part
+                if name_part: core_query_term = name_part
+                
+            elif len(parts) == 2:
+                key_part = parts[0].strip().replace(" ", "_")
+                label_part = parts[1].strip()
+                
+                if key_part: fact_key = re.sub(r"[^a-z0-9_]", "", key_part.lower())
+                if label_part: fact_label = label_part
+                core_query_term = "ALL" 
+        else:
+            key_part = raw_output.replace(" ", "_")
+            fact_key = re.sub(r"[^a-z0-9_]", "", key_part.lower())
+            fact_label = fact_key
+            core_query_term = "ALL" 
+            
+        if not fact_key: fact_key = "general"
+        if not fact_label: fact_label = "General"
+        if not core_query_term: core_query_term = question
+        
+        # (SỬA LỖI V88)
+        print(f"[call_llm_to_classify] (Prompt V88) Query: '{question}' -> Key: '{fact_key}' | Label: '{fact_label}' | CoreQuery: '{core_query_term}'")
+        return fact_key, fact_label, core_query_term
         
     except Exception as e:
-        print(f"❌ Lỗi call_llm_to_classify: {e}")
-        return "general_query"
+        # (SỬA LỖI V88)
+        print(f"❌ Lỗi call_llm_to_classify (V88): {e}")
+        return "general", "General", question
+    
+    
+    
     
 # 🧠 LangChain + OpenAI + Vector (Đã sửa đổi)
 # =========================================================
@@ -1661,21 +1925,17 @@ def list_sessions(user_id_str: str) -> List[dict]:
     return sorted_sessions
 
 # =========================================================
-# 🖼️ & 🗂️ Lưu ảnh / file + ghi chú vào vectorstore (Đã sửa đổi)
-# =========================================================
-
-
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1210)
 def _save_image_and_note(
     vectorstore: Chroma,
     src_path: str, 
     user_text: str, 
     original_name: str,
-    fact_key: str = "general"
+    fact_key: str = "general",
+    fact_label: str = "General" 
 ) -> Tuple[str, str]:
     """
-    (SỬA LỖI METADATA v2) Copy ảnh và ghi 1 dòng note [IMAGE]
-    VỚI METADATA (fact_key + file_type).
+    (SỬA LỖI V94 - THÊM TIMESTAMP)
     """
     name = original_name or os.path.basename(src_path) or f"image-{uuid.uuid4().hex[:6]}"
     ext = os.path.splitext(name)[1]
@@ -1684,28 +1944,34 @@ def _save_image_and_note(
     dst = os.path.join(PUBLIC_FILES_DIR, safe_name) 
     shutil.copyfile(src_path, dst)
     
-    # --- 🚀 BẮT ĐẦU SỬA LỖI 🚀 ---
-    note_text = f"[IMAGE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
-    # (MỚI) Thêm file_type
-    metadata = {"fact_key": fact_key, "file_type": "image"}
+    original_content_str = f"[IMAGE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
+    vector_text_str = f"{fact_label} | {name} | {user_text.strip() or '(no note)'}"
     
-    vectorstore.add_texts(texts=[note_text], metadatas=[metadata])
-    # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+    metadata = {
+        "fact_key": fact_key, 
+        "fact_label": fact_label, 
+        "file_type": "image",
+        "original_content": original_content_str, 
+        "entry_type": "file_master",
+        "timestamp": datetime.now(VN_TZ).isoformat() # <-- 🚀 SỬA LỖI V94
+    }
+    
+    vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
     
     return dst, name
 
-# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1235)
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1700)
 def _save_file_and_note(
     vectorstore: Chroma,
     src_path: str, 
     original_name: Optional[str], 
     user_text: str,
     fact_key: str = "general",
-    file_type: str = "file" # <-- THÊM THAM SỐ NÀY
+    fact_label: str = "General", 
+    file_type: str = "file" 
 ) -> Tuple[str, str]:
     """
-    (SỬA LỖI METADATA v2) Copy file và ghi 1 dòng note [FILE]
-    VỚI METADATA (fact_key + file_type).
+    (SỬA LỖI V94 - THÊM TIMESTAMP)
     """
     name = original_name or os.path.basename(src_path) or f"file-{uuid.uuid4().hex[:6]}"
     ext = os.path.splitext(name)[1]
@@ -1714,16 +1980,21 @@ def _save_file_and_note(
     dst = os.path.join(PUBLIC_FILES_DIR, safe_name)
     shutil.copyfile(src_path, dst)
     
-    # --- 🚀 BẮT ĐẦU SỬA LỖI 🚀 ---
-    note_text = f"[FILE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
-    # (MỚI) Dùng file_type được truyền vào
-    metadata = {"fact_key": fact_key, "file_type": file_type}
+    original_content_str = f"[FILE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
+    vector_text_str = f"{fact_label} | {name} | {user_text.strip() or '(no note)'}"
     
-    vectorstore.add_texts(texts=[note_text], metadatas=[metadata])
-    # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+    metadata = {
+        "fact_key": fact_key, 
+        "fact_label": fact_label, 
+        "file_type": file_type,
+        "original_content": original_content_str, 
+        "entry_type": "file_master",
+        "timestamp": datetime.now(VN_TZ).isoformat() # <-- 🚀 SỬA LỖI V94
+    }
+    
+    vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
     
     return dst, name
-
 def _get_text_splitter() -> RecursiveCharacterTextSplitter:
     """Tạo một text splitter tiêu chuẩn."""
     return RecursiveCharacterTextSplitter(
@@ -1733,28 +2004,28 @@ def _get_text_splitter() -> RecursiveCharacterTextSplitter:
         is_separator_regex=False,
     )
 
-# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1280)
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1270)
 def _load_and_process_document(
     vectorstore: Chroma,
     src_path: str, 
     original_name: str, 
     mime_type: str, 
     user_note: str,
-    fact_key: str = "general"
+    fact_key: str = "general",
+    fact_label: str = "General" 
 ) -> Tuple[int, str]:
     """
-    (SỬA LỖI METADATA v2 - THEO Ý USER)
-    1. Lưu Chunks (CÓ file_type).
-    2. Lưu bản ghi [FILE] (CÓ fact_key + file_type).
+    (SỬA LỖI V94 - THÊM TIMESTAMP)
+    1. (V94) Thêm timestamp vào CHUNKS.
+    2. (V94) Thêm timestamp vào FILE_UNSUPPORTED/ERROR.
     """
     
-    # --- 🚀 BẮT ĐẦU SỬA LỖI (THEO Ý USER) 🚀 ---
-    # 0. (MỚI) Lấy file_type đơn giản (dùng helper vừa tạo)
     simple_file_type = _get_simple_file_type(mime_type, src_path)
-    # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
-    
-    text_content = ""
     metadata_note = f"Trích từ tài liệu: {original_name} | Ghi chú của người dùng: {user_note}"
+    text_content = ""
+    
+    # (SỬA LỖI V94) Lấy timestamp 1 lần
+    current_timestamp_iso = datetime.now(VN_TZ).isoformat()
 
     try:
         # 1. Đọc nội dung (logic không đổi)
@@ -1777,16 +2048,23 @@ def _load_and_process_document(
             with open(src_path, "r", encoding="utf-8") as f:
                 text_content = f.read()
         else:
-            # --- 🚀 SỬA LỖI (FILE KHÔNG HỖ TRỢ) 🚀 ---
-            note = f"[FILE_UNSUPPORTED] path={src_path} | name={original_name} | note={user_note}"
-            metadata = {"fact_key": fact_key, "file_type": simple_file_type} # <-- SỬA
-            vectorstore.add_texts(texts=[note], metadatas=[metadata])
+            # --- (FILE KHÔNG HỖ TRỢ) ---
+            original_content_str = f"[FILE_UNSUPPORTED] path={src_path} | name={original_name} | note={user_note}"
+            vector_text_str = f"{fact_label} | {original_name} | {user_note} | File không hỗ trợ"
+            metadata = {
+                "fact_key": fact_key, 
+                "fact_label": fact_label, 
+                "file_type": simple_file_type,
+                "original_content": original_content_str,
+                "entry_type": "file_master",
+                "timestamp": current_timestamp_iso # <-- 🚀 SỬA LỖI V94
+            }
+            vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
             
-            # Gọi hàm helper (SỬA: truyền simple_file_type)
-            _save_file_and_note(vectorstore, src_path, original_name, user_note, fact_key, simple_file_type)
+            # (Hàm _save_file_and_note đã được sửa V94)
+            _save_file_and_note(vectorstore, src_path, original_name, user_note, fact_key, fact_label, simple_file_type) 
             return 0, original_name
-            # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
-
+            
         if not text_content.strip():
             raise ValueError("File rỗng hoặc không thể trích xuất nội dung.")
 
@@ -1798,33 +2076,44 @@ def _load_and_process_document(
             for chunk in chunks
         ]
 
-        # --- 🚀 SỬA LỖI (LƯU CHUNKS) 🚀 ---
-        # 4. Lưu Chunks (KHÔNG CÓ fact_key, nhưng PHẢI CÓ file_type)
-        # (Vì chunks chỉ dùng để tra cứu nội dung, không cần fact_key)
-        chunk_metadatas = [{"file_type": simple_file_type} for _ in chunks_with_metadata]
+        # --- (LƯU CHUNKS) ---
+        chunk_metadatas = [{
+            "file_type": simple_file_type, 
+            "fact_label": fact_label, 
+            "fact_key": fact_key,
+            "entry_type": "file_chunk",
+            "timestamp": current_timestamp_iso # <-- 🚀 SỬA LỖI V94
+        } for _ in chunks_with_metadata] 
+        
         vectorstore.add_texts(
             texts=chunks_with_metadata, 
-            metadatas=chunk_metadatas # <-- SỬA: Thêm metadata (chỉ file_type)
+            metadatas=chunk_metadatas
         )
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+        # --- KẾT THÚC LƯU CHUNKS ---
         
-        # 5. Lưu bản ghi [FILE] (SỬA: truyền simple_file_type)
-        # (Bản ghi này có cả fact_key và file_type)
-        _save_file_and_note(vectorstore, src_path, original_name, user_note, fact_key, simple_file_type)
+        # 5. Lưu bản ghi [FILE] (Hàm này đã được sửa V94)
+        _save_file_and_note(vectorstore, src_path, original_name, user_note, fact_key, fact_label, simple_file_type)
         
         return len(chunks_with_metadata), original_name
 
     except Exception as e:
         print(f"[ERROR] _load_and_process_document failed: {e}")
         
-        # --- 🚀 SỬA LỖI (LƯU LỖI) 🚀 ---
-        error_note = f"[ERROR_PROCESSING_FILE] name={original_name} | note={user_note} | error={e}"
-        metadata = {"fact_key": fact_key, "file_type": simple_file_type} # <-- SỬA
-        vectorstore.add_texts(texts=[error_note], metadatas=[metadata])
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+        # --- (LƯU LỖI) ---
+        original_content_str = f"[ERROR_PROCESSING_FILE] name={original_name} | note={user_note} | error={e}"
+        vector_text_str = f"{fact_label} | {original_name} | {user_note} | Lỗi xử lý file"
+        metadata = {
+            "fact_key": fact_key, 
+            "fact_label": fact_label, 
+            "file_type": simple_file_type,
+            "original_content": original_content_str,
+            "entry_type": "file_master",
+            "timestamp": current_timestamp_iso # <-- 🚀 SỬA LỖI V94
+        }
+        vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
+        # --- KẾT THÚC LƯU LỖI ---
         
         raise
-    
 # =========================================================
 # 🧩 Tiện ích xem bộ nhớ (Đã sửa đổi)
 # =========================================================
@@ -1839,24 +2128,31 @@ def dump_all_memory_texts(vectorstore: Chroma) -> str: # <-- SỬA
     except Exception as e:
         return f"⚠️ Không đọc được bộ nhớ: {e}"
 
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1868)
 def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
-    """SỬA ĐỔI: Quét ChromaDB của user."""
+    """
+    (SỬA LỖI V94 - LẤY TIMESTAMP)
+    Quét ChromaDB của user
+    Lọc bằng metadata['file_type'] != 'text'
+    Đọc dữ liệu từ metadata['original_content']
+    """
     out = []
     try:
         data = vectorstore._collection.get(
-            where_document={"$or": [
-                {"$contains": "[FILE]"},
-                {"$contains": "[IMAGE]"}
-            ]},
-            include=["documents"]
+            where={"file_type": {"$ne": "text"}},
+            include=["documents", "metadatas"] 
         )
         
         ids = data.get("ids", [])
         docs = data.get("documents", [])
+        metadatas = data.get("metadatas", []) 
         
-        for doc_id, content in zip(ids, docs):
-            if not content: continue
+        for doc_id, document_text, metadata in zip(ids, docs, metadatas):
+            if not metadata: continue
             
+            content = metadata.get("original_content")
+            if not content: continue 
+
             path_match = re.search(r"path=([^|]+)", content)
             name_match = re.search(r"name=([^|]+)", content)
             note_match = re.search(r"note=([^|]+)", content)
@@ -1865,25 +2161,38 @@ def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
             file_name = name_match.group(1).strip() if name_match else "unknown"
             user_note = note_match.group(1).strip() if note_match else "(không có)"
             
-            # SỬA: path bây giờ là /public/files/tên_đã_uuid
             saved_name = os.path.basename(file_path)
+            file_type_str = metadata.get("file_type", "file")
+            
+            type_tag = f"[{file_type_str.upper()}]"
+            if file_type_str == "image": type_tag = "[IMAGE]"
+            elif file_type_str == "text": continue 
+            
+            # --- 🚀 SỬA LỖI V94 (LẤY TIMESTAMP) 🚀 ---
+            # (Lấy timestamp, nếu không có thì dùng mốc 0)
+            ts_str = metadata.get("timestamp", "1970-01-01T00:00:00+00:00")
+            # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
             
             out.append({
                 "doc_id": doc_id,
-                "file_path": file_path, # Đường dẫn tuyệt đối trên disk server
-                "saved_name": saved_name, # Tên file trong /public/files
+                "file_path": file_path,
+                "saved_name": saved_name,
                 "original_name": file_name,
                 "note": user_note,
-                "type": "[IMAGE]" if "[IMAGE]" in content else "[FILE]"
+                "type": type_tag,
+                "timestamp_str": ts_str # <-- (V94) Thêm vào dict
             })
             
     except Exception as e:
         import traceback
-        print("[ERROR] Lỗi nghiêm trọng trong list_active_files:")
+        print("[ERROR] Lỗi nghiêm trọng trong list_active_files (V94):")
         print(traceback.format_exc())
         
-    return sorted(out, key=lambda x: (x["original_name"]))
-
+    # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
+    # Sắp xếp theo timestamp (mới nhất lên đầu)
+    return sorted(out, key=lambda x: x["timestamp_str"], reverse=True)
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
+    
 
 # =========================================================
 # 🧠 Trích FACT (SỬ DỤNG LLM) - (Hàm mới)
@@ -1935,9 +2244,12 @@ KHÔNG được giải thích.
 # =========================================================
 # 🔔 Push API & Scheduler Helpers (GỘP TỪ CODE CŨ)
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 872)
-
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 900)
 async def ui_show_all_memory():
-    """(MỚI) Hiển thị tất cả ghi chú (trừ file/image) với nút xóa."""
+    """(SỬA LỖI V94 - SẮP XẾP THEO TIMESTAMP)
+    Hiển thị tất cả ghi chú (trừ file/image) 
+    với nút xóa, MỚI NHẤT LÊN ĐẦU.
+    """
     vectorstore = cl.user_session.get("vectorstore")
     if not vectorstore:
         await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
@@ -1945,41 +2257,43 @@ async def ui_show_all_memory():
     
     # Phải chạy sync
     def _get_docs_sync():
-        return vectorstore._collection.get(include=["documents"])
+        return vectorstore._collection.get(
+            where={"file_type": "text"}, # <-- (V94) Chỉ lấy text
+            include=["documents", "metadatas"]
+        )
     
     raw_data = await asyncio.to_thread(_get_docs_sync)
     
     ids = raw_data.get("ids", [])
     docs = raw_data.get("documents", [])
+    metadatas = raw_data.get("metadatas", []) # (V94) Lấy metadatas
     
     if not docs:
         await cl.Message(content="📭 Bộ nhớ đang trống. Chưa lưu gì cả.").send()
         return
 
     notes_found = 0
-    await cl.Message(content="📝 **Các ghi chú đã lưu (Văn bản):**").send()
+    await cl.Message(content="📝 **Các ghi chú đã lưu (Văn bản - Mới nhất lên đầu):**").send()
     
-    for doc_id, content in zip(ids, docs):
+    # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
+    # (Dùng helper V94 đã tạo ở Bước 1)
+    sorted_results = _helper_sort_results_by_timestamp(ids, docs, metadatas)
+    
+    for doc_id, content, metadata in sorted_results:
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
+    
         if not content: continue
         
-        # --- BỘ LỌC ĐẦY ĐỦ ---
-        if content.startswith("[FILE]") or \
-           content.startswith("[IMAGE]") or \
-           content.startswith("[REMINDER_") or \
-           content.startswith("[ERROR_PROCESSING_FILE]") or \
-           content.startswith("[FILE_UNSUPPORTED]") or \
-           content.startswith("Trích từ tài liệu:") or \
-           content.startswith("FACT:"):
+        # (Bộ lọc này giữ nguyên, mặc dù 'where' đã lọc)
+        if content.startswith(("[FILE]", "[IMAGE]", "[REMINDER_", 
+           "[ERROR_PROCESSING_FILE]", "[FILE_UNSUPPORTED]", 
+           "Trích từ tài liệu:", "FACT:")):
             continue
         
         notes_found += 1
         
-        # --- SỬA LỖI UI (DÙNG POPUP) ---
-        
-        # 1. Tạo tin nhắn (chưa gửi)
+        # (Phần UI (Popup) giữ nguyên)
         msg = cl.Message(content="") 
-        
-        # 2. Nút Xóa (Luôn có)
         actions = [
             cl.Action(
                 name="delete_note", 
@@ -1988,34 +2302,25 @@ async def ui_show_all_memory():
             )
         ]
         
-        # 3. Logic hiển thị (Ngắn / Dài)
-        # (Đặt 150 ký tự, hoặc nếu có xuống dòng)
         if len(content) > 150 or "\n" in content:
-            # GHI CHÚ DÀI: Hiển thị tóm tắt và thêm nút "Xem chi tiết"
             summary = "• " + (content.split('\n', 1)[0] or content).strip()[:150] + "..."
             msg.content = summary
-            
-            # Thêm nút MỚI để mở Popup
             actions.append(
                 cl.Action(
-                    name="show_note_detail", # Gọi callback mới
-                    payload={"doc_id": doc_id},    # Chỉ cần doc_id
+                    name="show_note_detail", 
+                    payload={"doc_id": doc_id},
                     label="📄 Xem chi tiết"
                 )
             )
         else:
-            # GHI CHÚ NGẮN: Hiển thị đầy đủ
             msg.content = f"• {content}"
-
-        # 4. Gán action và gửi
-        msg.actions = actionsds
+        
+        msg.actions = actions
         await msg.send()
-        # --- KẾT THÚC SỬA LỖI UI ---
 
     if notes_found == 0:
          await cl.Message(content="📭 Không tìm thấy ghi chú văn bản nào (chỉ có file/lịch nhắc).").send()
-         
-         
+
 # --- Helper: Retry cho Push API ---
 from requests.adapters import HTTPAdapter
 try:
@@ -2386,7 +2691,15 @@ def parse_repeat_to_seconds(text: str) -> int:
     return 0
 # (Thêm hàm mới này vào khoảng dòng 1150)
 # (Thêm hàm mới này vào khoảng dòng 1150)
+# (DÁN 2 HÀM HELPER MỚI NÀY VÀO - KHOẢNG DÒNG 1140)
 
+def _get_start_of_day(dt: datetime) -> datetime:
+    """Helper: Lấy 00:00:00 của một ngày (trong VN_TZ)."""
+    return VN_TZ.localize(datetime(dt.year, dt.month, dt.day, 0, 0, 0))
+
+def _get_end_of_day(dt: datetime) -> datetime:
+    """Helper: Lấy 23:59:59 của một ngày (trong VN_TZ)."""
+    return VN_TZ.localize(datetime(dt.year, dt.month, dt.day, 23, 59, 59))
 async def _llm_parse_dt(llm: ChatOpenAI, when_str: str) -> datetime:
     """
     (MỚI) Dùng LLM (GPT) để phân tích thời gian tự nhiên của người dùng.
@@ -2654,7 +2967,158 @@ async def _on_show_note_detail(action: cl.Action):
         traceback.print_exc() 
         await cl.Message(content=f"❌ Lỗi khi mở dschi tiết (Debug): {str(e)}").send()
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 872)
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1945)
+async def display_interactive_list(where_clause: dict, title: str):
+    """
+    (SỬA LỖI V94 - SẮP XẾP THEO TIMESTAMP)
+    Hàm "Trái Tim" (V61)
+    1. (Cũ) Lấy "documents" (cho text) VÀ "metadatas" (cho file/image).
+    2. (MỚI) Sắp xếp kết quả bằng helper V94.
+    3. Hiển thị (MỚI NHẤT LÊN ĐẦU).
+    """
+    
+    vectorstore = cl.user_session.get("vectorstore")
+    if not vectorstore:
+        await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
+        return 0 
 
+    try:
+        await cl.Message(content=f"**{title} (Mới nhất lên đầu)**").send() # <-- (V94) Thêm
+        
+        final_where_for_chroma = where_clause if where_clause else None
+        
+        results = await asyncio.to_thread(
+            vectorstore._collection.get, 
+            where=final_where_for_chroma,
+            include=["documents", "metadatas"] 
+        )
+        if results is None: results = {}
+        
+        ids = results.get("ids", [])
+        docs = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+        
+        if not ids:
+            await cl.Message(content="📭 Không tìm thấy mục nào khớp với bộ lọc này.").send()
+            return 0
+
+        found_count = 0
+        
+        # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
+        sorted_results = _helper_sort_results_by_timestamp(ids, docs, metadatas)
+        
+        for doc_id, document_text, metadata in sorted_results:
+        # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
+            
+            if not metadata: metadata = {}
+            file_type = metadata.get("file_type", "text")
+            
+            msg = cl.Message(content="")
+            
+            edit_action = cl.Action(
+                name="edit_item_placeholder",
+                payload={"doc_id": doc_id},
+                label="✏️ Sửa"
+            )
+            actions = []
+            
+            # (Logic Hiển thị File/Ảnh (V76) giữ nguyên)
+            if file_type != "text":
+                content = metadata.get("original_content")
+                if not content:
+                    msg.content = f"Lỗi: {file_type} (ID: {doc_id}) thiếu 'original_content' trong metadata."
+                    await msg.send()
+                    continue
+                try:
+                    path_match = re.search(r"path=([^|]+)", content)
+                    name_match = re.search(r"name=([^|]+)", content)
+                    note_match = re.search(r"note=([^|]+)", content)
+                    if not path_match: continue
+                    
+                    full_path = path_match.group(1).strip()
+                    saved_name = os.path.basename(full_path)
+                    safe_href = f"/public/files/{saved_name}"
+                    
+                    goc_name = name_match.group(1).strip() if name_match else "N/A"
+                    goc_note = note_match.group(1).strip() if note_match else "(không ghi chú)"
+                    safe_name = html.escape(goc_name)
+                    
+                    display_content = ""
+                    if file_type == 'image':
+                        display_content = f"**{safe_name}** [IMAGE]\n![{safe_name}]({safe_href})"
+                    else:
+                        display_content = f"**[{safe_name}]({safe_href})** [{file_type.upper()}]"
+                    
+                    msg.content = f"{display_content}\n• Ghi chú: *{goc_note}*\n• ID: `{doc_id}`"
+                    actions = [
+                        cl.Action(
+                            name="delete_file",
+                            payload={"doc_id": doc_id, "file_path": full_path, "message_id": msg.id},
+                            label="🗑️ Xóa File"
+                        ),
+                        edit_action
+                    ]
+                except Exception as e_file:
+                    msg.content = f"Lỗi parse file: {e_file}"
+            
+            # (Logic Hiển thị Text (V76) giữ nguyên)
+            else:
+                content = document_text 
+                if content.startswith(("[REMINDER_", "FACT:", "[FILE_UNSUPPORTED]", "[ERROR_PROCESSING_FILE]")):
+                    continue
+                
+                summary = content
+                if len(summary) > 200 or "\n" in summary:
+                     summary = (content.split('\n', 1)[0] or content).strip()[:200] + "..."
+                msg.content = f"**Ghi chú:** {summary}\n• ID: `{doc_id}`"
+                actions = [
+                    cl.Action(
+                        name="delete_note", 
+                        payload={"doc_id": doc_id, "message_id": msg.id},
+                        label="🗑️ Xóa Ghi chú"
+                    ),
+                    edit_action
+                ]
+            
+            # 2d. Gửi tin nhắn
+            msg.actions = actions
+            await msg.send()
+            found_count += 1
+
+        return found_count
+        
+    except Exception as e:
+        await cl.Message(content=f"❌ Lỗi display_interactive_list: {e}").send()
+        return 0
+    
+    
+@cl.action_callback("edit_item_placeholder")
+async def _on_edit_item_placeholder(action: cl.Action):
+    """(MỚI V61) Placeholder cho tính năng "Sửa"."""
+    await cl.Message(
+        content="ℹ️ Tính năng 'Sửa' (Edit) đang được phát triển. "
+                "Hiện tại, bạn có thể 'Xóa' và upload/lưu lại."
+    ).send()
+    
+@cl.action_callback("show_category_items")
+async def _on_show_category_items(action: cl.Action):
+    """(MỚI V61) Xử lý khi bấm nút "Label" (Danh mục)."""
+    try:
+        fact_key = action.payload.get("fact_key")
+        fact_label = action.payload.get("fact_label", fact_key)
+        
+        if not fact_key:
+             await cl.Message(content="❌ Lỗi: Không nhận được fact_key.").send()
+             return
+             
+        # Gọi hàm "Trái Tim"
+        await display_interactive_list(
+            where_clause={"fact_key": fact_key},
+            title=f"Danh sách các mục trong: {fact_label} (Key: {fact_key})"
+        )
+    except Exception as e:
+        await cl.Message(content=f"❌ Lỗi _on_show_category_items: {e}").send()
+            
 async def ui_show_all_memory():
     """(MỚI) Hiển thị tất cả ghi chú (trừ file/image) với nút xóa."""
     vectorstore = cl.user_session.get("vectorstore")
@@ -3542,6 +4006,10 @@ class LuuThongTinSchema(BaseModel):
 class DoiMatKhauSchema(BaseModel):
     email: str = Field(..., description="Email của user cần đổi mật khẩu")
     new_password: str = Field(..., description="Mật khẩu mới (dạng text thô) cho user đó")
+# (DÁN CLASS MỚI NÀY VÀO KHOẢNG DÒNG 3500)
+class TimCongViecSchema(BaseModel):
+    thoi_gian: str = Field(..., description="Mô tả thời gian (ví dụ: 'hôm nay', 'ngày mai', 'tuần này', 'tháng 11')")
+    
 class PushThuSchema(BaseModel):
     noidung: str = Field(description="Nội dung thông báo để push ngay")
 # (THAY THẾ CLASS NÀY - khoảng dòng 3690)
@@ -3568,97 +4036,82 @@ def save_pending_action(tool_name: str, args: dict):
     except Exception as e:
         print(f"❌ [Debug] LError khi save_pending_action: {e}")
 # (Tìm hàm _clean_context_for_llm (khoảng dòng 3080) và THAY THẾ)
-def _build_clean_context_for_llm(docs_goc_content: list) -> str:
-    """Helper: (SỬA LỖI 20) Tạo context SẠCH (chỉ name+note)
-    để LLM chọn ra người chiến thắng."""
-    
-    clean_parts = []
-    
-    for i, content in enumerate(docs_goc_content):
-        # 1. Tìm các phần chúng ta MUỐN GIỮ LẠI
-        type_tag = "[IMAGE]" # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 3080)
-def _build_clean_context_for_llm(docs_goc_content: list) -> str:
-    """Helper: (SỬA LỖI METADATA) Tạo context SẠCH
-    cho LLM (từ văn bản thuần túy).
+# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3030)
+def _build_clean_context_for_llm(
+    docs_goc_content: list, 
+    ids_goc: list # <-- (SỬA LỖI 65) Thêm ids_goc
+) -> str:
+    """Helper: (SỬA LỖI 65) Tạo context SẠCH
+    Dùng DOC_ID (UUID) làm TAG để so khớp tuyệt đối.
     """
     clean_parts = []
     
-    for i, content in enumerate(docs_goc_content):
+    # (SỬA) Lặp qua cả 3 list
+    for i, (content, doc_id) in enumerate(zip(docs_goc_content, ids_goc)):
         
         # --- 🚀 BẮT ĐẦU SỬA LOGIC 🚀 ---
         
-        # 1. Bỏ qua các chuỗi metadata cũ (nếu còn sót)
+        # 1. Bỏ qua các chuỗi metadata cũ
         if "| fact_key=" in content or content.startswith(("FACT:", "[REMINDER_")):
              continue
              
         # 2. Xử lý [IMAGE]/[FILE] (nếu có)
-        type_tag = "[TEXT]" # Mặc định
-        name_str = ""
+        type_tag = "[TEXT]" 
         note_str = ""
         
         if content.startswith(("[IMAGE]", "[FILE]")):
             type_tag = "[IMAGE]" if "[IMAGE]" in content else "[FILE]"
-            name_match = re.search(r"name=([^|]+)", content)
             note_match = re.search(r"note=([^|]+)", content)
-            
-            name_str = name_match.group(1).strip() if name_match else f"file_{i}"
             note_str = note_match.group(1).strip() if note_match else "(không ghi chú)"
         
         else: # Đây là [TEXT]
-            # Dùng chính nội dung làm "tên" (an toàn)
-            name_str = content.strip()
-            # Bỏ qua note (vì nó là nội dung)
-            note_str = "" 
+            note_str = content.strip() # Dùng chính nội dung
             
         # 3. Xây dựng chuỗi "sạch"
-        # (Quan trọng) Chúng ta dùng 'name' làm ID
-        
-        # (SỬA) Nếu là [TEXT], chỉ cần trả về Tag
-        if type_tag == "[TEXT]":
-            clean_parts.append(f"<{name_str}>{name_str}</{name_str}>")
-        else:
-            clean_parts.append(f"<{name_str}>{type_tag} | note={note_str}</{name_str}>")
+        # (SỬA) Dùng DOC_ID (ví dụ: <b48f1f15...>) làm TAG
+        clean_parts.append(f"<{doc_id}>{type_tag} | note={note_str}</{doc_id}>")
         
         # --- 🚀 KẾT THÚC SỬA LOGIC 🚀 ---
         
     return "\n".join(clean_parts)
+
 # (Tìm hàm _is_general_query, khoảng dòng 3080, và THAY THẾ TOÀN BỘ)
+# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3080)
 async def _is_general_query(llm: ChatOpenAI, query: str, fact_key: str) -> bool:
     """
-    (SỬA LỖI 26: V2 - TỐI ƯU HÓA THÔNG MINH)
-    Sửa lỗi 'anh du lich ha long' bị đánh dấu 'GENERAL'.
-    Chỉ đánh dấu 'GENERAL' nếu query không có từ chi tiết thừa.
+    (SỬA LỖI 64: TỐI ƯU HÓA V3 - NGHIÊM NGẶT)
+    Nếu phát hiện "từ chi tiết" (extra_words_str) -> Buộc SPECIFIC.
     """
     try:
         # 1. Chuẩn hóa
         query_clean = unidecode.unidecode(query.lower().strip())
         key_clean = fact_key.replace("_", " ").lower().strip()
         
-        # --- 🚀 BẮT ĐẦU SỬA LỖI LOGIC TỐI ƯU (V2) 🚀 ---
+        # --- 🚀 BẮT ĐẦU SỬA LỖI LOGIC TỐI ƯU (V3) 🚀 ---
         
         # 2. (Tối ưu) Kiểm tra
         if key_clean in query_clean:
-            # Lấy các từ thừa (ví dụ: "xem", "ha long")
             extra_words_str = query_clean.replace(key_clean, "").strip()
             
-            # Xóa các "stop word" (từ vô nghĩa)
+            # Xóa các "stop word"
             extra_words_str = extra_words_str.replace("xem", "").replace("tim", "").strip()
             extra_words_str = extra_words_str.replace("hinh", "").replace("anh", "").strip()
+            extra_words_str = extra_words_str.replace("file", "").replace("ds", "").strip() # (Bổ sung)
             
-            # Kiểm tra xem có còn "từ chi tiết" (như 'ha long') không
             if not extra_words_str:
                 # Nếu không còn từ nào -> Đây là GENERAL
-                print(f"[_is_general_query] Tối ưu V2: Query khớp chính xác. Đánh dấu GENERAL.")
+                print(f"[_is_general_query] Tối ưu V3: Query khớp chính xác. Đánh dấu GENERAL.")
                 return True
             else:
-                # Nếu còn từ (ví dụ: "ha long") -> Đây là SPECIFIC
-                print(f"[_is_general_query] Tối ưu V2: Query có từ chi tiết ('{extra_words_str}').")
-                print(f"[_is_general_query] -> Bỏ qua tối ưu. Hỏi LLM...")
-                # (KHÔNG return True nữa, để cho LLM ở bước 3 quyết định)
+                # Nếu còn từ (ví dụ: "nhan su") -> Đây là SPECIFIC
+                print(f"[_is_general_query] Tối ưu V3: Query có từ chi tiết ('{extra_words_str}').")
+                print(f"[_is_general_query] -> BUỘC LỌC (SPECIFIC). (Bỏ qua LLM B3)")
+                return False # <-- (SỬA LỖI 64 NẰM Ở ĐÂY)
         
         # --- 🚀 KẾT THÚC SỬA LỖI LOGIC TỐI ƯU 🚀 ---
 
         # 3. Nếu tối ưu thất bại -> Hỏi LLM (an toàn)
+        # (Ví dụ: query 'tôi thích ăn gì?' -> key 'so_thich' (key không có trong query))
         prompt = f"""Bạn là một chuyên gia phân loại ý định.
         
         Câu hỏi của người dùng (Query): "{query}"
@@ -3697,6 +4150,8 @@ async def _is_general_query(llm: ChatOpenAI, query: str, fact_key: str) -> bool:
     except Exception as e:
         print(f"❌ Lỗi _is_general_query: {e}. Mặc định là SPECIFIC.")
         return False # An toàn: mặc định là lọc (SPECIFIC)
+    
+    
 # (Dán hàm MỚI HOÀN TOÀN này vào, ngay trước hàm hoi_thong_tin)
 async def _display_rag_result(content_goc: str) -> bool:
     """
@@ -3872,38 +4327,396 @@ async def _display_rag_result(content_goc: str) -> bool:
     except Exception as e:
         print(f"❌ Lỗi hiển thị Ghi chú: {e}")
         return False
+# (DÁN HÀM MỚI NÀY VÀO KHOẢNG DÒNG 2990)
+def _helper_sort_results_by_timestamp(
+    ids: List[str], 
+    docs: List[str], 
+    metadatas: List[dict]
+) -> List[tuple[str, str, dict]]:
+    """
+    (MỚI - V94) Helper: Sắp xếp kết quả Chroma
+    theo 'timestamp' (mới nhất lên đầu).
+    """
+    temp_results_list = []
     
+    # 1. Gộp 3 list lại
+    for doc_id, content, metadata in zip(ids, docs, metadatas):
+        ts_str = "1970-01-01T00:00:00+00:00" # Mốc Unix (cho data cũ)
+        
+        # (Sửa lỗi V91 - Chống None)
+        if metadata and metadata.get("timestamp"):
+            ts_str = metadata.get("timestamp")
+        
+        temp_results_list.append({
+            "id": doc_id, 
+            "content": content, 
+            "metadata": metadata, 
+            "timestamp_str": ts_str
+        })
     
-# (Dán hàm MỚI này vào khoảng dòng 3170, ngay trước hoi_thong_tin)
+    # 2. Sắp xếp (mới nhất -> cũ nhất)
+    try:
+        sorted_temp_list = sorted(
+            temp_results_list, 
+            key=lambda x: x["timestamp_str"], 
+            reverse=True
+        )
+    except Exception as e_sort:
+        print(f"⚠️ Lỗi khi sắp xếp timestamp (V94 Helper): {e_sort}. Dùng danh sách gốc.")
+        sorted_temp_list = temp_results_list
+
+    # 3. Trả về dạng list of tuples
+    return [
+        (item["id"], item["content"], item["metadata"]) 
+        for item in sorted_temp_list
+    ]
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 3000)
 def _build_rag_filter_from_query(query: str) -> Optional[dict]:
-    """(MỚI) Helper: Phân tích query để tạo bộ lọc metadata."""
-    # (Dùng unidecode để tìm "tai lieu" (tiếng Việt không dấu))
+    """(SỬA LỖI V89)
+    Thay vì .startswith (quá khắt khe), dùng regex
+    để tìm TỪ KHÓA (word) 'anh'/'hinh'/'file'.
+    (SỬA LỖI 77)
+    Thay vì lọc theo file_type (gây nhiễu),
+    chúng ta lọc theo 'entry_type': 'file_master'.
+    """
+    
     q_low = unidecode.unidecode(query.lower())
     
-    file_type_keywords = {
-        "excel": ["excel", "xlsx", "xls", "trang tinh", "spreadsheet"],
-        "word": ["word", "docx", "doc", "van ban", "tai lieu"],
-        "pdf": ["pdf"],
-        "image": ["anh", "hinh", "image", "jpg", "png", "jpeg"],
-        "text": ["text", "txt", "ghi chu", "note"],
-    }
+    # --- 🚀 BẮT ĐẦU SỬA LỖI V89 (Regex) 🚀 ---
     
-    # 1. Tìm loại file CỤ THỂ
-    # (Chỉ tìm nếu có từ "file" hoặc "danh sach" (để tránh "xem ảnh"))
-    if "file" in q_low or "danh sach" in q_low or "ds" in q_low or "tai lieu" in q_low:
-         for f_type, keywords in file_type_keywords.items():
-            for kw in keywords:
-                if kw in q_low:
-                    print(f"[_build_rag_filter] Phát hiện lọc theo file_type: {f_type}")
-                    return {"file_type": f_type}
-                    
-    # 2. Tìm (chỉ) ảnh
-    if q_low.startswith(("xem anh", "tim anh", "ds anh", "xem hinh", "tim hinh")):
-         print(f"[_build_rag_filter] Phát hiện lọc (chỉ) ảnh: image")
-         return {"file_type": "image"}
+    # 1. (SỬA) Ưu tiên: Tìm (chỉ) ảnh
+    # (Tìm từ 'anh' hoặc 'hinh' đứng riêng lẻ)
+    if re.search(r"\b(anh|hinh|images?|imgs?)\b", q_low):
+         print(f"[_build_rag_filter] (Sửa lỗi V89) Phát hiện lọc (chỉ) ảnh GỐC (Regex).")
+         return {
+             "$and": [
+                 {"file_type": "image"},
+                 {"entry_type": "file_master"}
+             ]
+         }
+
+    # 2. (SỬA) Tìm file GỐC
+    file_keywords = [
+        "file", "excel", "xlsx", "xls", "trang tinh", 
+        "word", "docx", "doc", "van ban", 
+        "pdf", "tai lieu", "danh sach", "ds"
+    ]
+    
+    # (Dùng regex \b(word)\b để tìm từ riêng lẻ)
+    if any(re.search(r"\b" + re.escape(kw) + r"\b", q_low) for kw in file_keywords):
+         print(f"[_build_rag_filter] (Sửa lỗi V89) Phát hiện lọc file GỐC (master) (Regex).")
+         # (Lấy TẤT CẢ các loại file GỐC, trừ Ghi chú)
+         return {"entry_type": "file_master"}
+    # --- 🚀 KẾT THÚC SỬA LỖI V89 🚀 ---
          
     # 3. Không phát hiện
-    return None    
+    return None
+
+class XoaCongViecSchema(BaseModel):
+        noi_dung_cong_viec: str = Field(..., description="Nội dung/Tiêu đề của công việc cần xóa, ví dụ: 'hoàn thành báo cáo'")
+        # (Đã xóa force_delete)
+@tool("xoa_cong_viec", args_schema=XoaCongViecSchema)
+async def xoa_cong_viec(noi_dung_cong_viec: str) -> str:
+    """
+    (LOGIC MỚI) Tìm và HIỂN THỊ TẤT CẢ công việc (task) khớp
+    với nút xóa riêng cho từng mục.
+    """
+    user_id_str = cl.user_session.get("user_id_str")
+    if not user_id_str:
+        return "❌ Lỗi: Mất user_id. Vui lòng F5."
+
+    # B1. TÌM (Dùng hàm SQL LIKE cũ)
+    tasks_found = await asyncio.to_thread(
+        _find_tasks_by_title_db, user_id_str, noi_dung_cong_viec
+    )
+    if not tasks_found:
+        return f"ℹ️ Không tìm thấy công việc nào (chưa hoàn thành) khớp với '{noi_dung_cong_viec}'."
+        
+    # B2. HIỂN THỊ (Gửi tin nhắn thông báo)
+    await cl.Message(
+        content=f"✅ Tôi tìm thấy {len(tasks_found)} công việc khớp với '{noi_dung_cong_viec}':"
+    ).send()
+    
+    # B3. LẶP VÀ GỬI TỪNG MỤC
+    for task in tasks_found:
+        task_id = task['id']
+        content = task['title']
+        description = task.get('description')
+        desc_str = f" - *{description}*" if description else ""
+        
+        # 3a. Tạo tin nhắn (chưa gửi)
+        msg = cl.Message(content=f"• **{content}**{desc_str}")
+        
+        # 3b. Tạo nút Xóa (Trỏ về callback 'delete_task' đã có)
+        actions = [
+            cl.Action(
+                name="delete_task", # <-- Gọi callback 'delete_task' đã có
+                payload={"task_id": task_id, "message_id": msg.id},
+                label="🗑️ Xóa công việc này"
+            )
+        ]
+        
+        # 3c. Gán action và gửi
+        msg.actions = actions
+        await msg.send()
+        
+    # B4. Trả về thông báo cho Agent
+    return f"✅ Đã hiển thị {len(tasks_found)} kết quả khớp với các nút xóa."
+@tool("lay_thong_tin_user", args_schema=LayThongTinUserSchema)
+async def lay_thong_tin_user(email: str):
+    """
+    (CHỈ ADMIN) Tra cứu và lấy thông tin chi tiết (như Tên)
+    của một user cụ thể bằng email của họ.
+    """
+    # 1. Kiểm tra quyền admin
+    is_admin = cl.user_session.get("is_admin", False)
+    if not is_admin:
+        return "❌ Lỗi: Bạn không có quyền thực hiện hành động này."
+
+    # 2. Chạy hàm sync get_user_by_email
+    try:
+        # (Hàm get_user_by_email đã có sẵn ở dòng 313)
+        user_data = await asyncio.to_thread(get_user_by_email, email)
+        
+        if not user_data:
+            return f"⚠️ Không tìm thấy user nào có email: {email}"
+        
+        # Lấy thông tin
+        user_name = user_data.get('name') or "(Chưa có tên)"
+        user_email = user_data.get('email')
+        is_active_str = "✅ Active" if user_data.get('is_active') == 1 else "⛔️ Inactive"
+        is_admin_str = "🔑 ADMIN" if user_data.get('is_admin') == 1 else "Thường"
+        
+        return (
+            f"✅ Thông tin user: {user_email}\n"
+            f"• Tên: **{user_name}**\n"
+            f"• Trạng thái: {is_active_str}\n"
+            f"• Quyền: {is_admin_str}"
+        )
+        
+    except Exception as e_thread:
+        return f"❌ Lỗi thread khi lấy thông tin user: {e_thread}"
+@tool("doi_mat_khau_user", args_schema=DoiMatKhauSchema)
+async def doi_mat_khau_user(email: str, new_password: str):
+    """
+    (CHỈ ADMIN) Đặt lại/Thay đổi mật khẩu cho một user
+    bằng một mật khẩu mới.
+    """
+    # 1. Kiểm tra quyền trong session
+    is_admin = cl.user_session.get("is_admin", False)
+    if not is_admin:
+        return "❌ Lỗi: Bạn không có quyền thực hiện hành động này."
+
+    # 2. Chạy hàm sync
+    try:
+        ok, message = await asyncio.to_thread(
+            _change_user_password_sync, 
+            email, 
+            new_password
+        )
+        return message
+    except Exception as e_thread:
+        return f"❌ Lỗi thread khi đổi mật khẩu: {e_thread}"
+class XoaGhiChuSchema(BaseModel):
+        noi_dung_ghi_chu: str = Field(..., description="Nội dung/từ khóa của ghi chú (note) cần xóa")
+        # (Không còn force_delete ở đây)
+@tool("xoa_ghi_chu", args_schema=XoaGhiChuSchema)
+async def xoa_ghi_chu(noi_dung_ghi_chu: str) -> str:
+    """
+    (LOGIC MỚI) Tìm và HIỂN THỊ TẤT CẢ ghi chú khớp
+    (dùng LLM filter) với nút xóa riêng cho từng mục.
+    """
+    vectorstore = cl.user_session.get("vectorstore")
+    llm = cl.user_session.get("llm_logic") 
+    
+    if not vectorstore: return "❌ Lỗi: Không tìm thấy vectorstore."
+    if not llm: return "❌ Lỗi: Không tìm thấy llm_logic (cần cho việc lọc)."
+
+    # --- BẮT ĐẦU LOGIC MỚI ---
+    
+    # B1. TÌM (Dùng hàm _find_... bạn đã có)
+    # (Hàm này đã chạy to_thread bên trong tool rồi nên ta await)
+    docs_found = await asyncio.to_thread(
+        _find_notes_for_deletion,
+        vectorstore,
+        llm,
+        noi_dung_ghi_chu
+    )
+    
+    if not docs_found:
+        return f"ℹ️ Không tìm thấy ghi chú văn bản nào (đã lọc bằng LLM) khớp với '{noi_dung_ghi_chu}'."
+        
+    # B2. HIỂN THỊ (Gửi tin nhắn thông báo)
+    await cl.Message(
+        content=f"✅ Tôi tìm thấy {len(docs_found)} ghi chú (đã lọc bằng LLM) khớp với '{noi_dung_ghi_chu}':"
+    ).send()
+    
+    # B3. LẶP VÀ GỬI TỪNG MỤC
+    # (Đây là logic giống hệt ui_show_all_memory)
+    for item in docs_found:
+        doc_id = item['id']
+        content = item['doc']
+        
+        # 3a. Tạo tin nhắn (chưa gửi)
+        msg = cl.Message(content="")
+        
+        # 3b. Tạo nút Xóa (Trỏ về message_id của chính nó)
+        actions = [
+            cl.Action(
+                name="delete_note", # <-- Gọi callback 'delete_note' đã có
+                payload={"doc_id": doc_id, "message_id": msg.id},
+                label="🗑️ Xóa ghi chú này"
+            )
+        ]
+        
+        # 3c. Hiển thị nội dung (Tóm tắt nếu quá dài)
+        if len(content) > 150 or "\n" in content:
+            summary = "• " + (content.split('\n', 1)[0] or content).strip()[:150] + "..."
+            msg.content = summary
+            
+            # Thêm nút "Xem chi tiết" (giống ui_show_all_memory)
+            actions.append(
+                cl.Action(
+                    name="show_note_detail",
+                    payload={"doc_id": doc_id},
+                    label="📄 Xem chi tiết"
+                )
+            )
+        else:
+            msg.content = f"• {content}"
+
+        # 3d. Gán action và gửi
+        msg.actions = actions
+        await msg.send()
+        
+    # B4. Trả về thông báo cho Agent
+    return f"✅ Đã hiển thị {len(docs_found)} kết quả khớp với các nút xóa."
+class XoaNhacNhoSchema(BaseModel):
+    noi_dung_nhac_nho: str = Field(..., description="Nội dung của nhắc nhở cần xóa")
+    # (Đã xóa force_delete)
+
+@tool("xoa_nhac_nho", args_schema=XoaNhacNhoSchema)
+async def xoa_nhac_nho(noi_dung_nhac_nho: str) -> str:
+    """
+    (LOGIC MỚI) Tìm và HIỂN THỊ TẤT CẢ lịch nhắc khớp
+    với nút xóa riêng cho từng mục.
+    """
+    
+    # B1. TÌM (Dùng hàm tìm cũ)
+    reminders_found = await asyncio.to_thread(
+        _find_reminders_by_text_db, noi_dung_nhac_nho
+    )
+    if not reminders_found:
+        return f"ℹ️ Không tìm thấy lịch nhắc nào (đang chạy) khớp với '{noi_dung_nhac_nho}'."
+        
+    # B2. HIỂN THỊ (Gửi tin nhắn thông báo)
+    await cl.Message(
+        content=f"✅ Tôi tìm thấy {len(reminders_found)} lịch nhắc khớp với '{noi_dung_nhac_nho}':"
+    ).send()
+    
+    # B3. LẶP VÀ GỬI TỪNG MỤC
+    for reminder in reminders_found:
+        job_id = reminder['id']
+        content = reminder['text']
+        
+        # 3a. Tạo tin nhắn (chưa gửi)
+        msg = cl.Message(content=f"• **{content}** (JobID: `{job_id}`)")
+        
+        # 3b. Tạo nút Xóa (Trỏ về callback 'delete_reminder' đã có)
+        actions = [
+            cl.Action(
+                name="delete_reminder", # <-- Gọi callback 'delete_reminder' đã có
+                payload={"job_id": job_id, "message_id": msg.id},
+                label="🗑️ Hủy lịch nhắc này"
+            )
+        ]
+        
+        # 3c. Gán action và gửi
+        msg.actions = actions
+        await msg.send()
+        
+    # B4. Trả về thông báo cho Agent
+    return f"✅ Đã hiển thị {len(reminders_found)} kết quả khớp với các nút xóa."
+# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3535)
+# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3535)
+@tool("luu_thong_tin", args_schema=LuuThongTinSchema)
+async def luu_thong_tin(noi_dung: str):
+    """
+    (SỬA LỖI V93 - THÊM TIMESTAMP KHI LƯU)
+    1. (CŨ) Dùng GPT (V88) để lấy fact_key, fact_label, VÀ core_query_term.
+    2. (SỬA V93) Thêm 'timestamp' (ISO string) vào metadata 
+        khi lưu chunks vào Vectorstore.
+    3. (CŨ) Chỉ lưu 'core_query_term' vào fact_map (cache).
+    """
+    vectorstore = cl.user_session.get("vectorstore")
+    llm = cl.user_session.get("llm_logic") 
+    user_id_str = cl.user_session.get("user_id_str") 
+
+    if not all([vectorstore, llm, user_id_str]):
+        return "❌ Lỗi: Thiếu (vectorstore, llm, user_id_str)."
+
+    try:
+        text = (noi_dung or "").strip()
+        if not text: return "⚠️ Không có nội dung để lưu."
+        
+        # --- 🚀 BƯỚC A: GỌI GPT (V88) 🚀 ---
+        fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
+        print(f"[luu_thong_tin] (Sửa lỗi V93) Đang gọi GPT (V88) để phân loại ghi chú (dài {len(text)} chars)...")
+        fact_key, fact_label, core_query_term = await call_llm_to_classify(
+            llm, text, fact_dict
+        )
+        print(f"[luu_thong_tin] (Sửa lỗi V93) GPT (V88) trả về: Key='{fact_key}', Label='{fact_label}', CoreQuery='{core_query_term}'")
+        
+        # --- 🚀 BƯỚC B: CHIA NHỎ VÀ LƯU VÀO CSDL VECTOR 🚀 ---
+        text_splitter = _get_text_splitter()
+        chunks = text_splitter.split_text(text)
+        if not chunks:
+            return "⚠️ Văn bản rỗng sau khi chia nhỏ, không lưu gì cả."
+        print(f"[luu_thong_tin] Đã chia nhỏ văn bản thành {len(chunks)} chunks.")
+
+        # --- 🚀 BẮT ĐẦU SỬA LỖI V93 (THÊM TIMESTAMP) 🚀 ---
+        
+        # 2. Chuẩn bị metadata (cho Vectorstore)
+        current_timestamp_iso = datetime.now(VN_TZ).isoformat()
+        
+        metadata_base = {
+            "fact_key": fact_key, 
+            "fact_label": fact_label, 
+            "file_type": "text",
+            "timestamp": current_timestamp_iso # <-- THÊM TIMESTAMP
+        }
+        metadatas_list = [metadata_base.copy() for _ in chunks]
+        
+        # --- 🚀 KẾT THÚC SỬA LỖI V93 🚀 ---
+        
+        # 3. Ghi CHUNKS vào Vectorstore
+        await asyncio.to_thread(
+            vectorstore.add_texts,
+            texts=chunks,
+            metadatas=metadatas_list
+        )
+        
+        # --- 🚀 BƯỚC C: LƯU VÀO CACHE (FACT_MAP) (SỬA LỖI V89) 🚀 ---
+        if core_query_term and core_query_term.strip().lower() != "all":
+            cache_key = core_query_term.strip().lower()
+            fact_dict[cache_key] = {"key": fact_key, "label": fact_label} 
+            await asyncio.to_thread(save_user_fact_dict, user_id_str, fact_dict)
+            print(f"[luu_thong_tin] (Sửa lỗi V93) Đã cập nhật cache: '{cache_key}' -> '{fact_key}'")
+        else:
+                print(f"[luu_thong_tin] (Sửa lỗi V93) Bỏ qua cập nhật cache vì CoreQuery là '{core_query_term}'")
+        
+        preview_text = chunks[0]
+        if len(preview_text) > 100:
+            preview_text = preview_text[:100] + "..."
+            
+        msg = f"✅ ĐÃ LƯU ({len(chunks)} chunks): {preview_text} (Label: {fact_label})"
+        return msg
+        
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return f"❌ LỖI LƯU: {e}"
+    
+    
 async def setup_chat_session(user: cl.User):
     """
     (CẬP NHẬT) Sửa lời chào để hiển thị tên user
@@ -3988,180 +4801,15 @@ async def setup_chat_session(user: cl.User):
     retrieval_chain = create_retrieval_chain(retriever, document_chain)
     cl.user_session.set("retrieval_chain", retrieval_chain)
     
-    class XoaCongViecSchema(BaseModel):
-        noi_dung_cong_viec: str = Field(..., description="Nội dung/Tiêu đề của công việc cần xóa, ví dụ: 'hoàn thành báo cáo'")
-        # (Đã xóa force_delete)
+    
 
-    @tool("xoa_cong_viec", args_schema=XoaCongViecSchema)
-    async def xoa_cong_viec(noi_dung_cong_viec: str) -> str:
-        """
-        (LOGIC MỚI) Tìm và HIỂN THỊ TẤT CẢ công việc (task) khớp
-        với nút xóa riêng cho từng mục.
-        """
-        user_id_str = cl.user_session.get("user_id_str")
-        if not user_id_str:
-            return "❌ Lỗi: Mất user_id. Vui lòng F5."
+    
 
-        # B1. TÌM (Dùng hàm SQL LIKE cũ)
-        tasks_found = await asyncio.to_thread(
-            _find_tasks_by_title_db, user_id_str, noi_dung_cong_viec
-        )
-        if not tasks_found:
-            return f"ℹ️ Không tìm thấy công việc nào (chưa hoàn thành) khớp với '{noi_dung_cong_viec}'."
-            
-        # B2. HIỂN THỊ (Gửi tin nhắn thông báo)
-        await cl.Message(
-            content=f"✅ Tôi tìm thấy {len(tasks_found)} công việc khớp với '{noi_dung_cong_viec}':"
-        ).send()
-        
-        # B3. LẶP VÀ GỬI TỪNG MỤC
-        for task in tasks_found:
-            task_id = task['id']
-            content = task['title']
-            description = task.get('description')
-            desc_str = f" - *{description}*" if description else ""
-            
-            # 3a. Tạo tin nhắn (chưa gửi)
-            msg = cl.Message(content=f"• **{content}**{desc_str}")
-            
-            # 3b. Tạo nút Xóa (Trỏ về callback 'delete_task' đã có)
-            actions = [
-                cl.Action(
-                    name="delete_task", # <-- Gọi callback 'delete_task' đã có
-                    payload={"task_id": task_id, "message_id": msg.id},
-                    label="🗑️ Xóa công việc này"
-                )
-            ]
-            
-            # 3c. Gán action và gửi
-            msg.actions = actions
-            await msg.send()
-            
-        # B4. Trả về thông báo cho Agent
-        return f"✅ Đã hiển thị {len(tasks_found)} kết quả khớp với các nút xóa."
+    
 
-    class XoaGhiChuSchema(BaseModel):
-        noi_dung_ghi_chu: str = Field(..., description="Nội dung/từ khóa của ghi chú (note) cần xóa")
-        # (Không còn force_delete ở đây)
+    
 
-    @tool("xoa_ghi_chu", args_schema=XoaGhiChuSchema)
-    async def xoa_ghi_chu(noi_dung_ghi_chu: str) -> str:
-        """
-        (LOGIC MỚI) Tìm và HIỂN THỊ TẤT CẢ ghi chú khớp
-        (dùng LLM filter) với nút xóa riêng cho từng mục.
-        """
-        vectorstore = cl.user_session.get("vectorstore")
-        llm = cl.user_session.get("llm_logic") 
-        
-        if not vectorstore: return "❌ Lỗi: Không tìm thấy vectorstore."
-        if not llm: return "❌ Lỗi: Không tìm thấy llm_logic (cần cho việc lọc)."
-
-        # --- BẮT ĐẦU LOGIC MỚI ---
-        
-        # B1. TÌM (Dùng hàm _find_... bạn đã có)
-        # (Hàm này đã chạy to_thread bên trong tool rồi nên ta await)
-        docs_found = await asyncio.to_thread(
-            _find_notes_for_deletion,
-            vectorstore,
-            llm,
-            noi_dung_ghi_chu
-        )
-        
-        if not docs_found:
-            return f"ℹ️ Không tìm thấy ghi chú văn bản nào (đã lọc bằng LLM) khớp với '{noi_dung_ghi_chu}'."
-            
-        # B2. HIỂN THỊ (Gửi tin nhắn thông báo)
-        await cl.Message(
-            content=f"✅ Tôi tìm thấy {len(docs_found)} ghi chú (đã lọc bằng LLM) khớp với '{noi_dung_ghi_chu}':"
-        ).send()
-        
-        # B3. LẶP VÀ GỬI TỪNG MỤC
-        # (Đây là logic giống hệt ui_show_all_memory)
-        for item in docs_found:
-            doc_id = item['id']
-            content = item['doc']
-            
-            # 3a. Tạo tin nhắn (chưa gửi)
-            msg = cl.Message(content="")
-            
-            # 3b. Tạo nút Xóa (Trỏ về message_id của chính nó)
-            actions = [
-                cl.Action(
-                    name="delete_note", # <-- Gọi callback 'delete_note' đã có
-                    payload={"doc_id": doc_id, "message_id": msg.id},
-                    label="🗑️ Xóa ghi chú này"
-                )
-            ]
-            
-            # 3c. Hiển thị nội dung (Tóm tắt nếu quá dài)
-            if len(content) > 150 or "\n" in content:
-                summary = "• " + (content.split('\n', 1)[0] or content).strip()[:150] + "..."
-                msg.content = summary
-                
-                # Thêm nút "Xem chi tiết" (giống ui_show_all_memory)
-                actions.append(
-                    cl.Action(
-                        name="show_note_detail",
-                        payload={"doc_id": doc_id},
-                        label="📄 Xem chi tiết"
-                    )
-                )
-            else:
-                msg.content = f"• {content}"
-
-            # 3d. Gán action và gửi
-            msg.actions = actions
-            await msg.send()
-            
-        # B4. Trả về thông báo cho Agent
-        return f"✅ Đã hiển thị {len(docs_found)} kết quả khớp với các nút xóa."
-
-    class XoaNhacNhoSchema(BaseModel):
-        noi_dung_nhac_nho: str = Field(..., description="Nội dung của nhắc nhở cần xóa")
-        # (Đã xóa force_delete)
-
-    @tool("xoa_nhac_nho", args_schema=XoaNhacNhoSchema)
-    async def xoa_nhac_nho(noi_dung_nhac_nho: str) -> str:
-        """
-        (LOGIC MỚI) Tìm và HIỂN THỊ TẤT CẢ lịch nhắc khớp
-        với nút xóa riêng cho từng mục.
-        """
-        
-        # B1. TÌM (Dùng hàm tìm cũ)
-        reminders_found = await asyncio.to_thread(
-            _find_reminders_by_text_db, noi_dung_nhac_nho
-        )
-        if not reminders_found:
-            return f"ℹ️ Không tìm thấy lịch nhắc nào (đang chạy) khớp với '{noi_dung_nhac_nho}'."
-            
-        # B2. HIỂN THỊ (Gửi tin nhắn thông báo)
-        await cl.Message(
-            content=f"✅ Tôi tìm thấy {len(reminders_found)} lịch nhắc khớp với '{noi_dung_nhac_nho}':"
-        ).send()
-        
-        # B3. LẶP VÀ GỬI TỪNG MỤC
-        for reminder in reminders_found:
-            job_id = reminder['id']
-            content = reminder['text']
-            
-            # 3a. Tạo tin nhắn (chưa gửi)
-            msg = cl.Message(content=f"• **{content}** (JobID: `{job_id}`)")
-            
-            # 3b. Tạo nút Xóa (Trỏ về callback 'delete_reminder' đã có)
-            actions = [
-                cl.Action(
-                    name="delete_reminder", # <-- Gọi callback 'delete_reminder' đã có
-                    payload={"job_id": job_id, "message_id": msg.id},
-                    label="🗑️ Hủy lịch nhắc này"
-                )
-            ]
-            
-            # 3c. Gán action và gửi
-            msg.actions = actions
-            await msg.send()
-            
-        # B4. Trả về thông báo cho Agent
-        return f"✅ Đã hiển thị {len(reminders_found)} kết quả khớp với các nút xóa."
+    
     
     @tool("hien_thi_web", args_schema=HienThiWebSchema)
     async def hien_thi_web(url: str) -> str:
@@ -4273,122 +4921,63 @@ async def setup_chat_session(user: cl.User):
         except Exception as e:
             return f"❌ Lỗi khi đọc từ điển fact: {e}"
 
-    @tool("luu_thong_tin", args_schema=LuuThongTinSchema)
-    async def luu_thong_tin(noi_dung: str):
-        """
-        (SỬA LỖI 38: CHUNKING TEXT - SỬA LỖI B9)
-        1. (CŨ) Dùng Cache/LLM Classifier để lấy fact_key.
-        2. (MỚI) Dùng TextSplitter để chia nhỏ (chunk) 'noi_dung'
-        (nếu nó quá dài).
-        3. Lưu các CHUNKS (chứ không phải 1 file) vào CSDL.
-        """
-        vectorstore = cl.user_session.get("vectorstore")
-        llm = cl.user_session.get("llm_logic") 
-        user_id_str = cl.user_session.get("user_id_str") 
-
-        if not all([vectorstore, llm, user_id_str]):
-            return "❌ Lỗi: Thiếu (vectorstore, llm, user_id_str)."
-
-        try:
-            text = (noi_dung or "").strip()
-            if not text: return "⚠️ Không có nội dung để lưu."
-            
-            # --- BƯỚC A: KIỂM TRA CACHE (Logic cache không đổi) ---
-            fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
-            existing_keys = list(set(fact_dict.values()))
-            user_note_clean_for_cache = text.strip().lower() 
-            fact_key = fact_dict.get(user_note_clean_for_cache)
-            
-            if fact_key:
-                print(f"[luu_thong_tin] (Cache HIT) Query: '{text}' -> Key: '{fact_key}'")
-            else:
-                print(f"[luu_thong_tin] (Cache MISS) Đang gọi LLM (Classifier v29 - Sẽ sửa ở B2) để phân loại: '{text}'")
-                fact_key = await call_llm_to_classify(llm, text, existing_keys) 
-                fact_dict[user_note_clean_for_cache] = fact_key
-                await asyncio.to_thread(save_user_fact_dict, user_id_str, fact_dict)
-                print(f"[luu_thong_tin] LLM trả về key: '{fact_key}'. Đã cập nhật cache.")
-            
-            # --- 🚀 BƯỚC B: CHIA NHỎ (CHUNKING) (LOGIC MỚI) 🚀 ---
-            
-            # 1. (MỚI) Dùng splitter (đã có ở global)
-            text_splitter = _get_text_splitter()
-            chunks = text_splitter.split_text(text)
-            
-            if not chunks:
-                return "⚠️ Văn bản rỗng sau khi chia nhỏ, không lưu gì cả."
-            
-            print(f"[luu_thong_tin] Đã chia nhỏ văn bản thành {len(chunks)} chunks.")
-
-            # 2. (MỚI) Chuẩn bị metadata
-            metadata_base = {"fact_key": fact_key, "file_type": "text"}
-            metadatas_list = [metadata_base.copy() for _ in chunks]
-            
-            # 3. (MỚI) Ghi CHUNKS vào CSDL
-            await asyncio.to_thread(
-                vectorstore.add_texts,
-                texts=chunks,
-                metadatas=metadatas_list
-            )
-            
-            # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
-            
-            # (Lấy chunk đầu tiên để hiển thị)
-            preview_text = chunks[0]
-            if len(preview_text) > 100:
-                preview_text = preview_text[:100] + "..."
-                
-            msg = f"✅ ĐÃ LƯU ({len(chunks)} chunks): {preview_text} (Key: {fact_key})"
-            return msg
-            
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            return f"❌ LỖI LƯU: {e}"
-
+    
+    # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 3611)
     @tool(args_schema=DatLichSchema)
     async def dat_lich_nhac_nho(noi_dung_nhac: str, thoi_gian: str, escalate: bool = False) -> str:
         """
         Lên lịch một thông báo nhắc nhở.
+        (SỬA LỖI V94 - THÊM TIMESTAMP)
         """
         vectorstore = cl.user_session.get("vectorstore")
         llm = cl.user_session.get("llm_logic") 
-        
-        # --- 🚀 BẮT ĐẦU SỬA LỖI (User-based) 🚀 ---
-        user_id_str = cl.user_session.get("user_id_str") # <-- Lấy User ID
+        user_id_str = cl.user_session.get("user_id_str") 
         
         if not vectorstore: return "❌ Lỗi: Không tìm thấy vectorstore."
         if not llm: return "❌ Lỗi: Không tìm thấy llm_logic." 
         if not user_id_str: return "❌ LỖI: Không tìm thấy 'user_id_str'. Vui lòng F5."
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
         
         try:
             ensure_scheduler()
             dt_when = None 
-            # (Xóa dòng internal_session_id, chúng ta dùng user_id_str)
             if not SCHEDULER: return "❌ LỖI NGHIÊM TRỌNG: Scheduler không thể khởi động."
             
             noti_text = (noi_dung_nhac or "").strip()
             if not noti_text: return "❌ Lỗi: Cần nội dung nhắc."
             
             facts_list = await _extract_fact_from_llm(llm, noti_text)
+            
+            # (SỬA LỖI V94) Lấy timestamp 1 lần
+            current_timestamp_iso = datetime.now(VN_TZ).isoformat()
+            
+            # (SỬA LỖI V94) Metadata chung
+            common_metadata = {
+                "file_type": "text", # Giả định là text
+                "timestamp": current_timestamp_iso
+            }
 
             repeat_sec = parse_repeat_to_seconds(thoi_gian)
             if repeat_sec > 0:
                 trigger = IntervalTrigger(seconds=repeat_sec, timezone=VN_TZ)
-                job_id = f"reminder-interval-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
-                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                job_id = f"reminder-interval-{user_id_str}-{uuid.uuid4().hex[:6]}"
+                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_INTERVAL] every={repeat_sec}s | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"🔁 ĐÃ LÊN LỊCH LẶP: '{noti_text}' • mỗi {repeat_sec} giây"
             
             cron = detect_cron_schedule(thoi_gian)
             if cron:
-                job_id = f"reminder-cron-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
-                SCHEDULER.add_job(_do_push, trigger=cron["trigger"], id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                job_id = f"reminder-cron-{user_id_str}-{uuid.uuid4().hex[:6]}"
+                SCHEDULER.add_job(_do_push, trigger=cron["trigger"], id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_CRON] type={cron['type']} | {thoi_gian} | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"📅 ĐÃ LÊN LỊCH ({cron['type']}): '{noti_text}' • {thoi_gian}"
             
@@ -4398,37 +4987,41 @@ async def setup_chat_session(user: cl.User):
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
             
             if escalate:
-                job_id = f"first-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
+                job_id = f"first-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
-                SCHEDULER.add_job(_first_fire_escalation_job, trigger=trigger, id=job_id, args=[user_id_str, noti_text, 5], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                SCHEDULER.add_job(_first_fire_escalation_job, trigger=trigger, id=job_id, args=[user_id_str, noti_text, 5], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_ESCALATE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"⏰ ĐÃ LÊN LỊCH (Leo thang): '{noti_text}' • lúc {_fmt_dt(dt_when)}"
             else:
-                job_id = f"reminder-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
+                job_id = f"reminder-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
-                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_ONCE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"⏰ ĐÃ LÊN LỊCH (1 lần): '{noti_text}' • lúc {_fmt_dt(dt_when)}"
         except Exception as e:
             return f"❌ Lỗi khi tạo nhắc: {e}"
-    # (THAY THẾ TOÀN BỘ TOOL NÀY - KHOẢNG DÒNG 3185)
+        
+    # (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3185)
     @tool
     async def hoi_thong_tin(cau_hoi: str):
         """
-        (SỬA LỖI 49 - TOOL MẶC ĐỊNH CỦA AGENT_ASK)
-        (ƯU TIÊN CUỐI) Sử dụng tool này cho TẤT CẢ các yêu cầu HỎI,
-        TÌM KIẾM, XEM, hoặc 'cho tôi' thông tin.
-        Tool này dùng để tìm GHI CHÚ (NOTE), FILE, ẢNH CÓ LỌC,
-        thông tin SERVER, PASSWORD, v.v.
-        (Ví dụ: 'xem ảnh du lịch', 'cho thong tin CH-SQLDB-WIN2k19-01').
-        Sử dụng tool này NẾU các tool chuyên biệt khác (như 
-        get_product_detail hoặc xem_danh_sach_file) KHÔNG KHỚP.
+        (SỬA LỖI V94 - DÙNG HELPER SẮP XẾP)
+        1. (Sửa lỗi V94) Refactor để dùng 
+           `_helper_sort_results_by_timestamp` (V94).
+        2. (Cũ) Nâng cấp Prompt B8 (V93) để GPT
+           ưu tiên kết quả đầu tiên (mới nhất).
+        
+        (LOGIC V90/V91 VẪN GIỮ NGUYÊN)
         """
         try:
             # --- Lấy các dependencies ---
@@ -4439,227 +5032,240 @@ async def setup_chat_session(user: cl.User):
             if not all([llm, vectorstore, user_id_str]):
                 return "❌ Lỗi: Thiếu (llm, vectorstore, user_id_str)."
 
-            print(f"[hoi_thong_tin] Đang RAG (Sửa lỗi 37) với query: '{cau_hoi}'")
+            print(f"[hoi_thong_tin] Đang RAG (Sửa lỗi V94) với query: '{cau_hoi}'")
 
-            # --- 🚀 BƯỚC 1: (MỚI) TÌM BỘ LỌC CỨNG (file_type) 🚀 ---
-            filter_metadata = _build_rag_filter_from_query(cau_hoi)
-            target_fact_key = "" 
+            # --- 🚀 BƯỚC 1: TÌM BỘ LỌC METADATA (file_type) 🚀 ---
+            file_type_filter = _build_rag_filter_from_query(cau_hoi) 
             
-            # --- 🚀 BƯỚC 2: (CŨ) TÌM FACT_KEY (Nếu B1 thất bại) 🚀 ---
-            if filter_metadata is None:
-                print(f"[hoi_thong_tin] B1 (Mới): Không phát hiện file_type.")
-                
-                # --- 🚀 BƯỚC 2a: (MỚI) KIỂM TRA CACHE 🚀 ---
-                fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
-                existing_keys = list(set(fact_dict.values()))
-                
-                query_clean_for_cache = cau_hoi.strip().lower()
-                target_fact_key = fact_dict.get(query_clean_for_cache) # <-- 1. ĐỌC CACHE
-                
-                if target_fact_key:
-                    # 2. CACHE HIT
-                    print(f"[hoi_thong_tin] B2 (Cache HIT) Query: '{cau_hoi}' -> Key: '{target_fact_key}'")
-                else:
-                    # 3. CACHE MISS
-                    print(f"[hoi_thong_tin] B2 (Cache MISS) Đang gọi LLM (Classifier v29)...")
-                    target_fact_key = await call_llm_to_classify(llm, cau_hoi, existing_keys) 
-                    print(f"[hoi_thong_tin] B2b: LLM trả về key: '{target_fact_key}'.")
-                    
-                    # 4. LƯU VÀO CACHE
-                    fact_dict[query_clean_for_cache] = target_fact_key
-                    await asyncio.to_thread(save_user_fact_dict, user_id_str, fact_dict)
-                # --- 🚀 KẾT THÚC BƯỚC 2a 🚀 ---
-                
-                # (MỚI) Gán bộ lọc
-                filter_metadata = {"fact_key": target_fact_key}
-            else:
-                print(f"[hoi_thong_tin] B1 (Mới): ĐÃ PHÁT HIỆN LỌC CỨNG. Bỏ qua LLM Classifier.")
-                target_fact_key = filter_metadata.get("file_type", "N/A") # Dùng để báo cáo
-
-            # --- BƯỚC 3: GỌI RAG (LỌC KEY) ---
-            # (Phần code còn lại của hàm hoi_thong_tin giữ nguyên
-            #  từ "print(f"[hoi_thong_tin] B3:..." cho đến hết)
+            # --- 🚀 BƯỚC 2: GỌI GPT V88 (VỚI FACT_MAP) 🚀 ---
+            fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
             
-            print(f"[hoi_thong_tin] B3: Đang tìm vector (RAG) VỚI BỘ LỌC METADATA: {filter_metadata}")
+            print(f"[hoi_thong_tin] B2 (Sửa lỗi V94) Đang gọi V88 (có fact_map) để lấy Key, Label, CoreQuery...")
             
-            query_vector = await asyncio.to_thread(embeddings.embed_query, cau_hoi)
-            results = await asyncio.to_thread(
-                vectorstore._collection.query,
-                query_embeddings=[query_vector],
-                n_results=20, 
-                where=filter_metadata,
-                include=["documents"]
+            target_fact_key, target_fact_label, core_search_query = await call_llm_to_classify(
+                llm, cau_hoi, fact_dict
             )
             
-            docs_goc_content = results.get("documents", [[]])[0]
-            run_specific_filter = False
+            # --- 🚀 BƯỚC 3: XỬ LÝ "DANH MUC" (Logic cũ - V61) 🚀 ---
+            if target_fact_key == "danh_muc":
+                # (Logic này giữ nguyên)
+                print(f"[hoi_thong_tin] Xử lý đặc biệt cho 'danh_muc'.")
+                if not fact_dict: return "ℹ️ Bạn chưa lưu danh mục nào (Từ điển fact đang trống)."
+                labels_to_keys = {}
+                for d in fact_dict.values():
+                    if isinstance(d, dict) and d.get('label') and d.get('key') != 'danh_muc':
+                        labels_to_keys[d.get('label')] = d.get('key')
+                    elif isinstance(d, str) and d != 'danh_muc' and d != 'general':
+                        label = d.replace("_", " ").title()
+                        labels_to_keys[label] = d
+                if not labels_to_keys: return "ℹ️ Bạn chưa lưu danh mục nào (Từ điển fact đang trống)."
+                actions = []
+                for label, key in sorted(labels_to_keys.items()):
+                    actions.append(
+                        cl.Action(
+                            name="show_category_items",
+                            label=f"📁 {label}",
+                            payload={"fact_key": key, "fact_label": label}
+                        )
+                    )
+                await cl.Message(
+                    content="✅ **Các danh mục (Label) hiện tại của bạn:**\n(Bấm để xem chi tiết)",
+                    actions=actions
+                ).send()
+                return "✅ Đã hiển thị danh sách danh mục (Label) dưới dạng nút bấm."
+
+            # --- 🚀 BƯỚC 4: XÂY DỰNG BỘ LỌC (SỬA LỖI V90) 🚀 ---
+            where_clause = {}
+            final_filter_list = []
             
-            if not docs_goc_content:
-                print(f"⚠️ [hoi_thong_tin] B3 (Lọc Key) không tìm thấy gì cho '{target_fact_key}'.")
-                return f"ℹ️ Không tìm thấy mục nào khớp (đã lọc theo key/type '{target_fact_key}')"
+            is_general_query = (core_search_query.upper() == "ALL" or not core_search_query.strip())
+            
+            if is_general_query:
+                # --- (1) LỌC CHUNG (GENERAL) ---
+                print("[hoi_thong_tin] B4 (Sửa lỗi V90): Lọc CHUNG (General). Sẽ dùng fact_key.")
+                if file_type_filter: final_filter_list.append(file_type_filter) 
+                if target_fact_key and target_fact_key != 'general':
+                    final_filter_list.append({'fact_key': target_fact_key})
+                    if target_fact_label and target_fact_label.lower() != 'general':
+                        final_filter_list.append({'fact_label': target_fact_label})
+            else:
+                # --- (2) LỌC CỤ THỂ (SPECIFIC) ---
+                print("[hoi_thong_tin] B4 (Sửa lỗi V90): Lọc CỤ THỂ (Specific). SẼ KHÔNG dùng fact_key.")
+                if file_type_filter: final_filter_list.append(file_type_filter)
+            
+            print(f"[hoi_thong_tin] B4: Bộ lọc metadata (V90) cuối cùng: {final_filter_list}")
+            
+            # Build lại final_where_for_chroma
+            if len(final_filter_list) > 1: where_clause = {"$and": final_filter_list}
+            elif len(final_filter_list) == 1: where_clause = final_filter_list[0]
+            else: where_clause = None
+            final_where_for_chroma = where_clause if where_clause else None
 
-            print(f"[hoi_thong_tin] B4: RAG tìm thấy {len(docs_goc_content)} ứng viên.")
-
-            # --- BƯỚC 4: KIỂM TRA CHUNG/CỤ THỂ (ĐÃ CẬP NHẬT) ---
-            if not run_specific_filter:
-                if _build_rag_filter_from_query(cau_hoi) is not None:
-                    print(f"[hoi_thong_tin] B4a (Mới): Đã lọc cứng (file_type), chuyển sang B5b (SPECIFIC).")
-                    run_specific_filter = True
-                else:
-                    is_general = await _is_general_query(llm, cau_hoi, target_fact_key)
-                    if is_general:
-                        # --- BƯỚC 5a (GENERAL) (Không đổi) ---
-                        print(f"[hoi_thong_tin] B5a (GENERAL): Hiển thị tất cả {len(docs_goc_content)} mục.")
-                        found_elements = False
-                        for content_goc in docs_goc_content:
-                            displayed = await _display_rag_result(content_goc)
-                            if displayed: found_elements = True
-                        
-                        if found_elements:
-                            return f"✅ Đã hiển thị tất cả các mục tìm thấy cho danh mục '{target_fact_key}'."
-                        else:
-                            return f"ℹ️ Đã tìm thấy {len(docs_goc_content)} mục cho '{target_fact_key}', nhưng không có mục nào có thể hiển thị."
-                    else:
-                        run_specific_filter = True 
-
-            # --- BƯỚC 5b (SPECIFIC) (ĐÃ CẬP NHẬT) ---
-            if run_specific_filter:
-                print(f"[hoi_thong_tin] B5b (SPECIFIC): Đang phân tích loại chunks...")
-
-                # 1. (MỚI) Kiểm tra xem kết quả (chunks) có phải là GHI CHÚ (TEXT) không
-                is_text_qa = False
-                for doc in docs_goc_content:
-                    # Nếu bất kỳ chunk nào KHÔNG phải là tag [FILE]/[IMAGE]
-                    # (tức là nó là [TEXT] hoặc chunk từ file)
-                    if not doc.startswith(("[IMAGE]", "[FILE]")):
-                        is_text_qa = True
-                        break
+            # --- 🚀 BƯỚC 5: THỰC THI (Logic cũ) 🚀 ---
+            if is_general_query:
+                # --- BƯỚC 5a (GENERAL) ---
+                print(f"[hoi_thong_tin] B5a (GENERAL): Đang gọi display_interactive_list (vì CoreQuery là 'ALL').")
+                if not target_fact_label: target_fact_label = target_fact_key.replace("_", " ").title()
                 
-                # --- 🚀 BƯỚC 5b.1: LOGIC MỚI (RAG Q&A - THEO Ý USER) 🚀 ---
-                if is_text_qa:
-                    print("[hoi_thong_tin] B5b (Logic: RAG Q&A) - Phát hiện Ghi chú/Text.")
-                    
-                    # 1. Gộp TẤT CẢ các chunk thô lại
-                    context_tho = "\n---\n".join(docs_goc_content)
-                    
-                    if not context_tho.strip():
-                        print(f"⚠️ [hoi_thong_tin] B5b (Lỗi): Context thô bị rỗng.")
-                        return "ℹ️ Đã tìm thấy các mục, nhưng nội dung của chúng bị rỗng."
+                # (Hàm display_interactive_list đã được sửa V94)
+                found = await display_interactive_list(
+                    where_clause=final_where_for_chroma, 
+                    title=f"Danh sách các mục trong: {target_fact_label} (Key: {target_fact_key})"
+                )
+                return f"✅ Đã hiển thị {found} mục tìm thấy cho danh mục '{target_fact_label}'."
+            else:
+                # --- BƯỚC 5b (SPECIFIC) (SỬA LỖI V90) ---
+                search_vector_query = core_search_query
+                print(f"[hoi_thong_tin] B5b (SPECIFIC / Sửa lỗi V90): Đang tìm vector BẰNG TỪ KHÓA: '{search_vector_query}'")
+                final_where_doc_for_chroma = None 
+                print(f"[hoi_thong_tin] B5c (Sửa lỗi V90): Passing to Chroma: (Query: '{search_vector_query}', Where: {final_where_for_chroma}, Where_Doc: {final_where_doc_for_chroma})")
+                
+                query_vector = await asyncio.to_thread(embeddings.embed_query, search_vector_query)
+                results = await asyncio.to_thread(
+                    vectorstore._collection.query,
+                    query_embeddings=[query_vector],
+                    n_results=20, 
+                    where=final_where_for_chroma, 
+                    where_document=final_where_doc_for_chroma, 
+                    include=["documents", "metadatas"] 
+                )
+                
+                docs_goc_content = results.get("documents", [[]])[0] 
+                docs_goc_metadatas = results.get("metadatas", [[]])[0] 
+                ids_goc = results.get("ids", [[]])[0] 
+                
+                if not docs_goc_content:
+                    return f"ℹ️ Đã tìm (CoreQuery: '{search_vector_query}', Filter (Sửa lỗi V90): Where={final_where_for_chroma}) nhưng không tìm thấy."
+                
+                # --- 🚀 SỬA LỖI V94 (DÙNG HELPER SẮP XẾP) 🚀 ---
+                # (Thay thế toàn bộ logic sort cũ bằng helper V94)
+                
+                final_results_to_display = _helper_sort_results_by_timestamp(
+                    ids_goc, docs_goc_content, docs_goc_metadatas
+                )
+                print(f"[hoi_thong_tin] (Sửa lỗi V94) Đã sắp xếp {len(final_results_to_display)} kết quả bằng helper (mới nhất lên đầu).")
+                
+                # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
 
-                    print(f"[hoi_thong_tin] B6: Gửi context ({len(context_tho)} chars) cho LLM để TRẢ LỜI...")
+                # --- B6. PHÂN LOẠI HIỂN THỊ (SỬA LỖI V91) ---
+                has_text_in_final_results = False
+                for _, content, metadata in final_results_to_display:
+                    file_type = "text" 
+                    if metadata: 
+                        file_type = metadata.get("file_type", "text")
+                    else:
+                        print("⚠️ [hoi_thong_tin] B6 (Sửa lỗi V91): Phát hiện metadata=None, giả định là 'text'.")
+                    if file_type == "text":
+                        has_text_in_final_results = True
+                        break 
+                
+                # B7. QUYẾT ĐỊNH HIỂN THỊ
+                if bool(file_type_filter) and not has_text_in_final_results:
+                    # (BƯỚC 7.1: CHUẨN BỊ ỨNG VIÊN)
+                    candidates_for_llm_filter = []
+                    for doc_id, _, metadata in final_results_to_display: 
+                        if not metadata: continue 
+                        file_type = metadata.get("file_type", "text")
+                        if file_type == "text": continue 
+                        content = metadata.get("original_content")
+                        if not content: continue
+                        try:
+                            name_match = re.search(r"name=([^|]+)", content)
+                            note_match = re.search(r"note=([^|]+)", content)
+                            goc_name = name_match.group(1).strip() if name_match else "N/A"
+                            goc_note = note_match.group(1).strip() if note_match else "(không ghi chú)"
+                            candidates_for_llm_filter.append({
+                                "id": doc_id, "name": goc_name, "note": goc_note, "metadata": metadata 
+                            })
+                        except Exception: continue 
+                    print(f"[hoi_thong_tin] B7: Đã có {len(candidates_for_llm_filter)} ứng viên file/ảnh. Đang gọi LLM Filter (Selection)...")
                     
-                    # 2. (MỚI) Tạo prompt RAG (trả lời câu hỏi)
+                    # (BƯỚC 7.2: GỌI LLM LỌC)
+                    final_filtered_results = await asyncio.to_thread(
+                        _llm_filter_for_selection, llm, cau_hoi, candidates_for_llm_filter
+                    )
+                    
+                    # (BƯỚC 7.3: HIỂN THỊ KẾT QUẢ ĐÃ LỌC)
+                    print(f"[hoi_thong_tin] B7 (Sửa lỗi): Hiển thị {len(final_filtered_results)} (Đã qua LLM Filter).")
+                    await cl.Message(content=f"**Kết quả lọc (đã qua LLM) cho: {cau_hoi}**").send()
+                    if not final_filtered_results:
+                        return f"ℹ️ Đã tìm thấy {len(candidates_for_llm_filter)} ứng viên, nhưng Bộ lọc LLM (Smart Filter) đã loại bỏ chúng (vì không khớp TÊN file)."
+                    found_count = 0
+                    for item in final_filtered_results:
+                        doc_id = item['id']; metadata = item['metadata']
+                        content = metadata.get("original_content"); file_type = metadata.get("file_type", "file")
+                        msg = cl.Message(content=""); edit_action = cl.Action(name="edit_item_placeholder", payload={"doc_id": doc_id}, label="✏️ Sửa")
+                        try:
+                            path_match = re.search(r"path=([^|]+)", content); name_match = re.search(r"name=([^|]+)", content); note_match = re.search(r"note=([^|]+)", content)
+                            if not path_match: continue
+                            full_path = path_match.group(1).strip(); saved_name = os.path.basename(full_path); safe_href = f"/public/files/{saved_name}"
+                            goc_name = name_match.group(1).strip() if name_match else "N/A"; goc_note = note_match.group(1).strip() if note_match else "(không ghi chú)"; safe_name = html.escape(goc_name)
+                            display_content = ""
+                            if file_type == 'image': display_content = f"**{safe_name}** [IMAGE]\n![{safe_name}]({safe_href})"
+                            else: display_content = f"**[{safe_name}]({safe_href})** [{file_type.upper()}]"
+                            msg.content = f"{display_content}\n• Ghi chú: *{goc_note}*\n• ID: `{doc_id}`"
+                            actions = [ cl.Action( name="delete_file", payload={"doc_id": doc_id, "file_path": full_path, "message_id": msg.id}, label="🗑️ Xóa File"), edit_action ]
+                            msg.actions = actions; await msg.send(); found_count += 1
+                        except Exception as e_file: await cl.Message(content=f"Lỗi parse file: {e_file}").send()
+                    return f"✅ Đã lọc (bằng LLM Smart Filter) và hiển thị {found_count} mục khớp."
+                
+                else: 
+                    # (ĐIỀU KIỆN 2: Q&A - SỬA LỖI V93)
+                    print(f"[hoi_thong_tin] B7 (Sửa lỗi V93): Gửi {len(final_results_to_display)} context (ĐÃ SẮP XẾP) cho RAG Q&A (Prompt V93)...")
+                    
+                    final_context_list = [content for _, content, _ in final_results_to_display if content]
+                    context_tho = "\n---\n".join(final_context_list)
+                    if not context_tho.strip(): return "ℹ️ Đã lọc, nhưng nội dung của chúng bị rỗng."
+                    
+                    print(f"[hoi_thong_tin] B8: Gửi context ({len(context_tho)} chars) cho LLM để TRẢ LỜI...")
+                    
+                    # --- 🚀 BẮT ĐẦU SỬA LỖI V93 (PROMPT MỚI) 🚀 ---
                     custom_prompt = f"""
-                    Bạn là một trợ lý thông tin, nhiệm vụ của bạn là trả lời câu hỏi của người dùng (Query)
-                    CHỈ DỰA VÀO thông tin được cung cấp trong (Context).
-                    
-                    Context (Nội dung các ghi chú/file đã lưu):
-                    ---
+                    Bạn là một trợ lý thông tin CỰC KỲ THÔNG MINH. Nhiệm vụ của bạn là trả lời câu hỏi của người dùng (Input) dựa trên (Context).
+
+                    Context:
                     {context_tho}
+                    
+                    Input: {cau_hoi}
+
+                    QUY TẮC PHÂN TÍCH (RẤT QUAN TRỌNG):
+                    1. Context đã được SẮP XẾP THEO THỜI GIAN. 
+                       Thông tin MỚI NHẤT nằm ở TRÊN CÙNG (Đầu tiên).
+                    2. Nếu Context chứa thông tin MÂU THUẪN (ví dụ: "tôi thích ăn phở" VÀ "tôi thích ăn bún bò"), 
+                       hãy ƯU TIÊN TUYỆT ĐỐI thông tin đầu tiên (mới nhất).
+                    3. Chỉ trả lời dựa trên thông tin MỚI NHẤT (Đầu tiên) nếu có mâu thuẫn.
+                    4. Nếu context không có thông tin, hãy nói "Tôi không tìm thấy thông tin này trong context."
+
+                    Ví dụ Context (Đã sắp xếp):
+                    tôi CHỈ thích ăn phở
                     ---
+                    tôi thích ăn bún bò
+                    ---
+                    tôi thích ăn cơm
                     
-                    Query (Câu hỏi của người dùng): "{cau_hoi}"
+                    Input: tôi thích ăn gì?
+                    Câu trả lời (ĐÚNG): Bạn CHỈ thích ăn phở.
                     
-                    Nhiệm vụ:
-                    1. Đọc kỹ Query.
-                    2. Tìm thông tin CHÍNH XÁC trong Context để trả lời Query.
-                    3. Trả lời trực tiếp vào vấn đề. KHÔNG giải thích, KHÔNG thêm thông tin ngoài lề.
-                    4. Nếu Context không chứa thông tin để trả lời, HÃY trả về một chuỗi rỗng.
-                    
-                    Câu trả lời (dựa trên Context):
+                    Input: {cau_hoi}
+                    Câu trả lời (dựa trên thông tin MỚI NHẤT):
                     """
+                    # --- 🚀 KẾT THÚC SỬA LỖI V93 🚀 ---
                     
-                    # 3. Gọi LLM
                     resp = await llm.ainvoke(custom_prompt)
                     llm_answer = resp.content.strip()
-
-                    print(f"[hoi_thong_tin] B7 (RAG): LLM trả về câu trả lời: '{llm_answer}'")
                     
-                    # 4. Trả về kết quả
-                    if not llm_answer:
-                        return f"ℹ️ Tôi tìm thấy {len(docs_goc_content)} mục liên quan, nhưng không tìm thấy câu trả lời chính xác cho '{cau_hoi}' trong đó."
+                    if not llm_answer or "không có thông tin" in llm_answer.lower() or "không tìm thấy" in llm_answer.lower():
+                        print(f"LLM RAG Q&A (V93) trả về không có gì: {llm_answer}")
+                        return f"ℹ️ Tôi tìm thấy {len(final_results_to_display)} mục liên quan, nhưng không tìm thấy câu trả lời chính xác cho '{cau_hoi}' trong đó."
                     else:
-                        return llm_answer # Trả về thẳng câu trả lời
-                
-                # --- 🚀 BƯỚC 5b.2: LOGIC CŨ (LỌC TÊN FILE/ẢNH) 🚀 ---
-                else:
-                    print("[hoi_thong_tin] B5b (Logic: Lọc Tên) - Chỉ phát hiện [FILE]/[IMAGE].")
+                        return llm_answer
                     
-                    context_sach = _build_clean_context_for_llm(docs_goc_content)
-                    
-                    if not context_sach:
-                        # (Code fallback cũ giữ nguyên)
-                        print(f"⚠️ [hoi_thong_tin] B5b (Lỗi Lọc Tên): Context sạch bị rỗng.")
-                        found_elements = False
-                        for content_goc in docs_goc_content:
-                            displayed = await _display_rag_result(content_goc)
-                            if displayed: found_elements = True
-                        if found_elements:
-                            return f"✅ (Fallback Lọc Tên) Đã hiển thị TẤT CẢ các mục tìm thấy cho '{target_fact_key}'."
-                        else:
-                            return f"ℹ️ Đã tìm thấy {len(docs_goc_content)} mục (FILE/IMAGE?), nhưng không thể lọc Tên."
-                    
-                    print(f"[hoi_thong_tin] B6 (Lọc Tên): Gửi context (sạch) cho LLM...")
-                    
-                    # (Prompt lọc tên cũ giữ nguyên)
-                    custom_prompt = f"""
-                    Yêu cầu của người dùng (Query): "{cau_hoi}"
-                    Danh sách các mục đã lưu (Context):
-                    {context_sach}
-                    Nhiệm vụ:
-                    1. Đọc Query.
-                    2. Tìm mục (hoặc các mục) trong Context khớp nhất với Query.
-                    3. Trả về CHÍNH XÁC TÊN của mục đó (là phần text nằm giữa <...> và </...>)
-                    4. Nếu tìm thấy nhiều, trả về mỗi name trên một dòng.
-                    5. Nếu không tìm thấy, trả về một chuỗi rỗng.
-                    6. KHÔNG giải thích. Chỉ trả về Name.
-                    Tên (Name) của mục khớp:
-                    """
-                    
-                    resp = await llm.ainvoke(custom_prompt)
-                    llm_response_text = resp.content.strip()
-
-                    print(f"[hoi_thong_tin] B7 (Lọc Tên): LLM (đã lọc) trả về Names: '{llm_response_text}'")
-
-                    if not llm_response_text:
-                        return "ℹ️ Tôi tìm thấy các mục liên quan, nhưng không có mục nào khớp chính xác với yêu cầu của bạn."
-                    
-                    winning_names = [name.strip() for name in llm_response_text.split('\n') if name.strip()]
-                    print(f"[hoi_thong_tin] B8 (Lọc Tên): Các 'name' thắng cuộc: {winning_names}")
-            
-                    found_elements = False
-                    
-                    # (Vòng lặp B9 cũ giữ nguyên)
-                    for content_goc in docs_goc_content:
-                        goc_name = ""
-                        if content_goc.startswith(("[IMAGE]", "[FILE]")):
-                            goc_name_match = re.search(r"name=([^|]+)", content_goc)
-                            if not goc_name_match: continue 
-                            goc_name = goc_name_match.group(1).strip()
-                        else:
-                            # (SỬA LOGIC B9: Nếu là text, goc_name là chính nó)
-                            goc_name = content_goc.strip()
-                        
-                        if goc_name in winning_names:
-                            print(f"[hoi_thong_tin] B9 (Rematch): Khớp! Đang hiển thị: {goc_name}")
-                            displayed = await _display_rag_result(content_goc)
-                            if displayed:
-                                found_elements = True
-                    
-                    if found_elements:
-                        return f"✅ Đã tìm và lọc (bằng Lọc Tên) {len(winning_names)} mục khớp."
-                    else:
-                        # (Sửa lỗi B9: Nếu nó tìm thấy text nhưng không match, báo lỗi này)
-                        print(f"⚠️ [hoi_thong_tin] B9 (Lỗi Rematch Lọc Tên): LLM đã chọn '{winning_names}' nhưng không thể Rematch/Hiển thị.")
-                        return "ℹ️ LLM (Lọc Tên) đã chọn, nhưng không thể Rematch/Hiển thị. (Lỗi logic B9)"
-            
-            # --- 🚀 KẾT THÚC SỬA LỖI 42 🚀 ---
-
         except Exception as e:
             import traceback; traceback.print_exc()
-            return f"❌ Lỗi RAG (Sửa lỗi 37): {e}"
+            return f"❌ Lỗi RAG (Sửa lỗi V94): {e}"    
 
-    @tool("xem_lich_nhac")
+    
+    @tool
     async def xem_lich_nhac() -> str:
         """
         Hiển thị tất cả các lịch nhắc (reminders)
@@ -4802,21 +5408,30 @@ async def setup_chat_session(user: cl.User):
         except Exception as e: return f"PUSH_THU_ERROR: {e}"
 
     # --- 🚀 BẮT ĐẦU CẬP NHẬT LOGIC TOOL (dòng 2060) 🚀 ---
+    # (THAY THẾ CLASS NÀY - khoảng dòng 4316)
     class DatLichCongViecSchema(BaseModel):
         noi_dung: str = Field(..., description="Nội dung công việc, ví dụ: 'Hoàn thành báo cáo'")
         thoi_gian: str = Field(..., description="Thời gian đến hạn: '1 phút nữa', '20:15', 'mai 8h', 'thứ 3 hàng tuần 9h'")
-        mo_ta: Optional[str] = Field(None, description="Mô tả chi tiết cho công việc") # <-- THÊM DÒNG NÀY
+        mo_ta: Optional[str] = Field(None, description="Mô tả chi tiết cho công việc")
+        # --- 🚀 THÊM DÒNG NÀY (SỬA LỖI V90) 🚀 ---
+        repeat_until_completed_min: Optional[int] = Field(None, description="Nếu đặt (ví dụ: 30), sẽ nhắc lại mỗi 30 phút cho đến khi được đánh dấu 'hoàn thành'.")
 
+    # (THAY THẾ HÀM NÀY - khoảng dòng 4330)
     @tool(args_schema=DatLichCongViecSchema)
-    async def dat_lich_cong_viec(noi_dung: str, thoi_gian: str, mo_ta: Optional[str] = None) -> str:
+    async def dat_lich_cong_viec(
+        noi_dung: str, 
+        thoi_gian: str, 
+        mo_ta: Optional[str] = None,
+        repeat_until_completed_min: Optional[int] = None # <-- NHẬN THAM SỐ MỚI
+    ) -> str:
         """
         Lên lịch một CÔNG VIỆC (task) cần hoàn thành.
         Công việc này có thể được xem và đánh dấu 'hoàn thành'.
+        (SỬA LỖI V90: Hỗ trợ lặp lại cho đến khi hoàn thành).
         """
         user_id_str = cl.user_session.get("user_id_str")
         internal_session_id = cl.user_session.get("chainlit_internal_id")
         
-        # --- 1. (MỚI) LẤY LLM VÀ VECTORSTORE ---
         vectorstore = cl.user_session.get("vectorstore")
         llm = cl.user_session.get("llm_logic")
         
@@ -4824,7 +5439,6 @@ async def setup_chat_session(user: cl.User):
             return "❌ Lỗi: Mất user_id hoặc internal_session_id. Vui lòng F5."
         if not vectorstore: return "❌ Lỗi: Không tìm thấy vectorstore."
         if not llm: return "❌ Lỗi: Không tìm thấy llm_logic."
-        # --- KẾT THÚC BƯỚC 1 ---
             
         try:
             ensure_scheduler()
@@ -4833,7 +5447,6 @@ async def setup_chat_session(user: cl.User):
             task_text = (noi_dung or "").strip()
             if not task_text: return "❌ Lỗi: Cần nội dung công việc."
             
-            # (Logic xử lý thời gian giữ nguyên)
             dt_when = None
             recurrence_rule = None
             trigger = None
@@ -4843,6 +5456,11 @@ async def setup_chat_session(user: cl.User):
             if cron:
                 recurrence_rule = f"cron:{cron['type']}:{thoi_gian}"
                 trigger = cron["trigger"]
+                # (SỬA LỖI V90) Không thể dùng lặp lại (cron) 
+                # VÀ lặp cho đến khi hoàn thành (repeat_min)
+                if repeat_until_completed_min:
+                    return f"❌ Lỗi: Bạn không thể dùng 'lặp lại hàng tuần/tháng' ({thoi_gian}) CÙNG LÚC với 'nhắc lại mỗi {repeat_until_completed_min} phút'."
+                
                 temp_job = SCHEDULER.add_job(_do_push, trigger=trigger, id=f"temp-{job_id_suffix}")
                 dt_when = temp_job.next_run_time
                 SCHEDULER.remove_job(temp_job.id)
@@ -4852,6 +5470,9 @@ async def setup_chat_session(user: cl.User):
                 recurrence_rule = f"interval:{repeat_sec}s"
                 trigger = IntervalTrigger(seconds=repeat_sec, timezone=VN_TZ)
                 dt_when = datetime.now(VN_TZ) + timedelta(seconds=repeat_sec)
+                
+                if repeat_until_completed_min:
+                    return f"❌ Lỗi: Bạn không thể dùng 'lặp lại mỗi {repeat_sec} giây' CÙNG LÚC với 'nhắc lại mỗi {repeat_until_completed_min} phút'."
 
             if not dt_when:
                 recurrence_rule = "once"
@@ -4861,19 +5482,23 @@ async def setup_chat_session(user: cl.User):
             if not dt_when or not trigger:
                 return f"❌ Lỗi: Không thể phân tích thời gian '{thoi_gian}'"
 
-            # (Logic lưu CSDL và Scheduler giữ nguyên)
+            # (Logic lưu CSDL và Scheduler)
             task_id = await asyncio.to_thread(
                 _add_task_to_db, user_id_str, task_text, mo_ta, dt_when, recurrence_rule, None
             )
             job_id = f"taskpush-{task_id}-{job_id_suffix}"
+            
+            # --- 🚀 BẮT ĐẦU SỬA LỖI V90 (TRUYỀN THAM SỐ) 🚀 ---
             SCHEDULER.add_job(
                 _push_task_notification, 
                 trigger=trigger, 
                 id=job_id, 
-                args=[internal_session_id, task_text, task_id],
+                # Truyền repeat_until_completed_min vào args
+                args=[internal_session_id, task_text, task_id, repeat_until_completed_min],
                 replace_existing=False, 
                 misfire_grace_time=60
             )
+            # --- 🚀 KẾT THÚC SỬA LỖI V90 🚀 ---
             
             conn = _get_user_db_conn()
             cursor = conn.cursor()
@@ -4881,20 +5506,21 @@ async def setup_chat_session(user: cl.User):
             conn.commit()
             conn.close()
 
-            # --- 2. (MỚI) TỰ ĐỘNG TẠO FACT ---
-            # (Tạo fact sau khi đã lưu CSDL thành công)
+            # (Logic tạo FACT giữ nguyên)
             try:
                 facts_list = await _extract_fact_from_llm(llm, task_text)
                 if facts_list:
-                    # Lưu cả nội dung gốc và fact (giống luu_thong_tin)
                     texts_to_save = [task_text] + facts_list
                     await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
                     print(f"[Task] Đã lưu FACT cho task: {task_text}")
             except Exception as e_fact:
                 print(f"⚠️ Lỗi khi lưu FACT cho task: {e_fact}")
-            # --- KẾT THÚC BƯỚC 2 ---
 
-            return f"✅ Đã lên lịch công việc: '{task_text}' (Hạn: {_fmt_dt(dt_when)})"
+            # (Sửa thông báo trả về)
+            msg = f"✅ Đã lên lịch công việc: '{task_text}' (Hạn: {_fmt_dt(dt_when)})"
+            if repeat_until_completed_min:
+                msg += f" (Sẽ nhắc lại mỗi {repeat_until_completed_min} phút nếu chưa hoàn thành)."
+            return msg
             
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -4924,6 +5550,81 @@ async def setup_chat_session(user: cl.User):
             return f"❌ Lỗi khi hiển thị danh sách công việc đã hoàn thành: {e}"
         return "✅ Đã liệt kê các công việc đã hoàn thành."
     # (Tool xem_danh_sach_user của bạn bắt đầu từ đây...)
+    
+    # (DÁN TOOL MỚI NÀY VÀO KHOẢNG DÒNG 4650)
+    @tool("tim_cong_viec_theo_ngay", args_schema=TimCongViecSchema)
+    async def tim_cong_viec_theo_ngay(thoi_gian: str) -> str:
+        """
+        (MỚI) Tìm và hiển thị các công việc (tasks) CHƯA HOÀN THÀNH
+        dựa trên một khoảng thời gian (ví dụ: 'ngày mai', 'hôm nay').
+        """
+        llm = cl.user_session.get("llm_logic")
+        if not llm:
+            return "❌ Lỗi: Không tìm thấy llm_logic."
+            
+        try:
+            # 1. Dùng LLM để lấy ngày
+            # (Chúng ta dùng _llm_parse_dt, nó rất giỏi việc này)
+            dt_target = await _llm_parse_dt(llm, thoi_gian)
+            
+            # 2. Xác định khoảng (bắt đầu, kết thúc)
+            # (Mặc định là lọc trong 1 ngày)
+            start_dt = _get_start_of_day(dt_target)
+            end_dt = _get_end_of_day(dt_target)
+            
+            # (Sửa logic cho "tuần này" hoặc "tháng này" nếu LLM hiểu)
+            low_q = thoi_gian.lower()
+            now = datetime.now(VN_TZ)
+            
+            if "tuần này" in low_q or "tuan nay" in low_q:
+                start_dt = _get_start_of_day(now - timedelta(days=now.weekday()))
+                end_dt = _get_end_of_day(start_dt + timedelta(days=6))
+            elif "tháng này" in low_q or "thang nay" in low_q:
+                start_dt = _get_start_of_day(now.replace(day=1))
+                last_day_num = calendar.monthrange(now.year, now.month)[1]
+                end_dt = _get_end_of_day(now.replace(day=last_day_num))
+            
+            # 3. Gọi hàm UI (đã được nâng cấp)
+            await ui_show_uncompleted_tasks(
+                start_date=start_dt,
+                end_date=end_dt,
+                filter_title=thoi_gian
+            )
+            
+            return f"✅ Đã hiển thị các công việc từ {_fmt_dt(start_dt)} đến {_fmt_dt(end_dt)}."
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return f"❌ Lỗi khi tìm công việc: {e}"
+    # (DÁN TOOL MỚI NÀY VÀO KHOẢNG DÒNG 4650)
+    @tool("tim_cong_viec_qua_han")
+    async def tim_cong_viec_qua_han() -> str:
+        """
+        (MỚI) Tìm và hiển thị các công việc (tasks) CHƯA HOÀN THÀNH
+        có ngày HẠN CHÓT (Due Date) ĐÃ QUA (quá hạn).
+        """
+        now_vn = datetime.now(VN_TZ)
+        
+        # Lấy ngày hôm nay (00:00:00) làm mốc so sánh
+        today_start = _get_start_of_day(now_vn)
+        
+        try:
+            # Gọi hàm UI (đã được nâng cấp) với bộ lọc:
+            # - start_date = None (không cần)
+            # - end_date = 'Hết ngày hôm qua' (Tất cả việc đến trước hôm nay)
+            yesterday_end = _get_end_of_day(now_vn - timedelta(days=1))
+            
+            await ui_show_uncompleted_tasks(
+                start_date=None, # Bỏ qua Start Date
+                end_date=yesterday_end, # Lọc tất cả task có Due Date đến hết ngày hôm qua
+                filter_title="Quá Hạn"
+            )
+            
+            return "✅ Đã hiển thị các công việc Quá Hạn (có hạn chót đến hết ngày hôm qua)."
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return f"❌ Lỗi khi tìm công việc Quá Hạn: {e}"
     @tool
     async def xem_danh_sach_user(xem: str = "xem"):
         """
@@ -4964,62 +5665,9 @@ async def setup_chat_session(user: cl.User):
         except Exception as e_thread:
             return f"❌ Lỗi thread khi lấy user: {e_thread}"
     # (THÊM TOOL MỚI NÀY VÀO ĐÂY - khoảng dòng 2083)
-    @tool("doi_mat_khau_user", args_schema=DoiMatKhauSchema)
-    async def doi_mat_khau_user(email: str, new_password: str):
-        """
-        (CHỈ ADMIN) Đặt lại/Thay đổi mật khẩu cho một user
-        bằng một mật khẩu mới.
-        """
-        # 1. Kiểm tra quyền trong session
-        is_admin = cl.user_session.get("is_admin", False)
-        if not is_admin:
-            return "❌ Lỗi: Bạn không có quyền thực hiện hành động này."
-
-        # 2. Chạy hàm sync
-        try:
-            ok, message = await asyncio.to_thread(
-                _change_user_password_sync, 
-                email, 
-                new_password
-            )
-            return message
-        except Exception as e_thread:
-            return f"❌ Lỗi thread khi đổi mật khẩu: {e_thread}"
+    
     # (THÊM TOOL MỚI NÀY VÀO ĐÂY - khoảng dòng 2100)
-    @tool("lay_thong_tin_user", args_schema=LayThongTinUserSchema)
-    async def lay_thong_tin_user(email: str):
-        """
-        (CHỈ ADMIN) Tra cứu và lấy thông tin chi tiết (như Tên)
-        của một user cụ thể bằng email của họ.
-        """
-        # 1. Kiểm tra quyền admin
-        is_admin = cl.user_session.get("is_admin", False)
-        if not is_admin:
-            return "❌ Lỗi: Bạn không có quyền thực hiện hành động này."
-
-        # 2. Chạy hàm sync get_user_by_email
-        try:
-            # (Hàm get_user_by_email đã có sẵn ở dòng 313)
-            user_data = await asyncio.to_thread(get_user_by_email, email)
-            
-            if not user_data:
-                return f"⚠️ Không tìm thấy user nào có email: {email}"
-            
-            # Lấy thông tin
-            user_name = user_data.get('name') or "(Chưa có tên)"
-            user_email = user_data.get('email')
-            is_active_str = "✅ Active" if user_data.get('is_active') == 1 else "⛔️ Inactive"
-            is_admin_str = "🔑 ADMIN" if user_data.get('is_admin') == 1 else "Thường"
-            
-            return (
-                f"✅ Thông tin user: {user_email}\n"
-                f"• Tên: **{user_name}**\n"
-                f"• Trạng thái: {is_active_str}\n"
-                f"• Quyền: {is_admin_str}"
-            )
-            
-        except Exception as e_thread:
-            return f"❌ Lỗi thread khi lấy thông tin user: {e_thread}"
+    
     # (MỚI) Định nghĩa tool cơ bản và tool admin
     # (THAY THẾ TOÀN BỘ KHỐI NÀY - khoảng dòng 2290)
 
@@ -5088,44 +5736,44 @@ async def setup_chat_session(user: cl.User):
                     "   - (Cho Nhắc nhở) Nếu user nói 'nhắc lại' -> đặt `escalate=True`.",
             "tool": dat_lich_nhac_nho
         },
-        # --- Tra cứu (Hỏi/Xem) ---
-       
+        
+        # --- 🚀 BẮT ĐẦU SỬA LỖI (V49b - THEO YÊU CẦU CỦA BẠN) 🚀 ---
+        # (Di chuyển các tool "XEM" lên đây và đặt ƯU TIÊN 1)
+        
+        "xem_bo_nho": {
+            "rule": "(XEM NOTE - ƯU TIÊN 1) CHỈ DÙNG nếu 'input' LÀ CHÍNH XÁC (hoặc rất giống) 'xem ghi chú', 'xem tất cả ghi chú', 'liệt kê ghi chú', 'xem bộ nhớ'. (Lệnh này không có từ khóa lọc).",
+            "tool": xem_bo_nho
+        },
+        "xem_danh_sach_file": {
+            "rule": "(XEM FILE - ƯU TIÊN 1) CHỈ DÙNG nếu 'input' LÀ CHÍNH XÁC (hoặc rất giống) 'xem danh sách file', 'xem tất cả file', 'liệt kê file'. (Lệnh này không có từ khóa lọc).",
+            "tool": xem_danh_sach_file
+        },
         "xem_viec_chua_hoan_thanh": {
-            "rule": "(XEM) Nếu 'input' yêu cầu 'xem công việc', 'xem checklist', 'xem việc CHƯA LÀM' -> Dùng `xem_viec_chua_hoan_thanh`.",
+            "rule": "(XEM TASK - ƯU TIÊN 1) Nếu 'input' yêu cầu 'xem công việc', 'xem checklist', 'xem việc CHƯA LÀM' -> Dùng `xem_viec_chua_hoan_thanh`.",
             "tool": xem_viec_chua_hoan_thanh
         },
         "xem_viec_da_hoan_thanh": {
-            "rule": "(XEM) Nếu 'input' yêu cầu 'xem việc ĐÃ HOÀN THÀNH', 'xem việc đã xong' -> Dùng `xem_viec_da_hoan_thanh`.",
+            "rule": "(XEM TASK - ƯU TIÊN 1) Nếu 'input' yêu cầu 'xem việc ĐÃ HOÀN THÀNH', 'xem việc đã xong' -> Dùng `xem_viec_da_hoan_thanh`.",
             "tool": xem_viec_da_hoan_thanh
         },
         "xem_lich_nhac": {
-            "rule": "(XEM) Nếu 'input' yêu cầu 'xem lịch nhắc', 'xem nhắc nhở' -> Dùng `xem_lich_nhac`.",
+            "rule": "(XEM TASK - ƯU TIÊN 1) Nếu 'input' yêu cầu 'xem lịch nhắc', 'xem nhắc nhở' -> Dùng `xem_lich_nhac`.",
             "tool": xem_lich_nhac
         },
-        # (XÓA HOẶC COMMENT LẠI KHỐI NÀY - khoảng dòng 4045)
-        # "tim_file_de_tai_ve": {
-        #     "rule": "(FILE - TẢI VỀ) Nếu 'input' yêu cầu 'tải file', 'lấy link file' (thường là 1 file) -> Dùng `tim_file_de_tai_ve`.",
-        #     "tool": tim_file_de_tai_ve
-        # },
-        # --- 🚀 KẾT THÚC BƯỚC 1 🚀 ---
-        # (THAY THẾ QUY TẮC NÀY - khoảng dòng 4050)
-       "xem_danh_sach_file": {
-            "rule": "(FILE - DỰ PHÒNG) CHỈ SỬ DỤNG nếu 'input' yêu cầu 'xem TẤT CẢ file', 'toàn bộ file', 'danh sách ĐẦY ĐỦ' (VÀ KHÔNG CHỨA TỪ KHÓA LỌC như 'excel', 'word', 'hợp đồng') -> Dùng `xem_danh_sach_file`.",
-            "tool": xem_danh_sach_file
-        },
-        # (THAY THẾ QUY TẮC NÀY - khoảng dòng 4055)
+
+        # (HẠ CẤP tool này xuống ƯU TIÊN 2)
         "hoi_thong_tin": {
-            # (SỬA LỖI 40: Mở rộng để "bắt" tất cả các câu hỏi)
-            "rule": "(HỎI/XEM/TÌM - ƯU TIÊN CAO) Dùng cho TẤT CẢ các câu HỎI, TÌM KIẾM, hoặc yêu cầu 'cho tôi', 'lấy cho tôi'."
-                    "(Ví dụ: 'cho toi ghi chú server thong tin', 'pass là gì', 'tìm file', 'tôi thích ăn gì?')."
-                    "Nếu input KHÔNG PHẢI là lệnh LƯU (bắt đầu bằng 'lưu:') hoặc XÓA (chứa 'xóa') -> HÃY DÙNG TOOL NÀY.",
+            "rule": "(HỎI/XEM/TÌM - ƯU TIÊN 2) Dùng làm DỰ PHÒNG cho TẤT CẢ các câu HỎI, TÌM KIẾM CÓ LỌC."
+                    "(Ví dụ: 'xem ghi chú server', 'tìm file excel', 'cho tôi pass', 'tôi thích ăn gì?')."
+                    "Dùng tool này NẾU các lệnh (ƯU TIÊN 1) không khớp.",
             "tool": hoi_thong_tin
         },
+        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+
+
         # --- Khác / Debug ---
-        "xem_bo_nho": {
-            "rule": "(KHÁC) Nếu 'input' yêu cầu 'xem bộ nhớ' (ghi chú text) -> Dùng `xem_bo_nho`.",
-            "tool": xem_bo_nho
-        },
+        # (Tool "xem_bo_nho" đã được di chuyển lên trên)
+        
         "xem_tu_dien_fact": {
             "rule": "(KHÁC) Nếu 'input' yêu cầu 'xem từ điển fact' (DEBUG) -> Dùng `xem_tu_dien_fact`.",
             "tool": xem_tu_dien_fact
@@ -5224,18 +5872,71 @@ async def setup_chat_session(user: cl.User):
     # === BƯỚC 2: TẠO CÁC SUB-AGENT CHUYÊN BIỆT ===
     
     # 2.1. Phân loại tool vào các nhóm
+    
+    # --- 🚀 BẮT ĐẦU SỬA LỖI (V49b) 🚀 ---
+    # (Phân nhóm lại dựa trên các tool đã sửa ở trên)
+    
     ask_tools_data = {
+        # (ƯU TIÊN 1A: TASK QUÁ HẠN)
+        "tim_cong_viec_qua_han": {
+            "rule": "(LỌC TASK - ƯU TIÊN 1A) Nếu 'input' yêu cầu 'xem công việc', 'xem task' VÀ CÓ TỪ KHÓA 'QUÁ HẠN', 'TRỄ' -> Dùng `tim_cong_viec_qua_han`.",
+            "tool": tim_cong_viec_qua_han # (Tool mới đã thêm)
+        },
+        
+        # (ƯU TIÊN 1B: LỌC TASK THEO NGÀY)
+        "tim_cong_viec_theo_ngay": {
+            "rule": "(LỌC TASK - ƯU TIÊN 1B) Nếu 'input' yêu cầu 'xem công việc', 'xem task' VÀ CÓ LỌC THỜI GIAN (ví dụ: 'ngày mai', 'hôm nay', 'tuần này') -> Dùng `tim_cong_viec_theo_ngay`.",
+            "tool": tim_cong_viec_theo_ngay 
+        },
+        
+        # (ƯU TIÊN 2: XEM TẤT CẢ TASK)
+        "xem_viec_chua_hoan_thanh": {
+            "rule": "(XEM TẤT CẢ TASK - ƯU TIÊN 2) Nếu 'input' chỉ yêu cầu 'xem công việc', 'xem checklist' (VÀ KHÔNG CÓ LỌC THỜI GIAN) -> Dùng `xem_viec_chua_hoan_thanh`.",
+            "tool": xem_viec_chua_hoan_thanh
+        },
+        "xem_viec_da_hoan_thanh": {
+            "rule": "(XEM TASK ĐÃ XONG - ƯU TIÊN 2) Nếu 'input' yêu cầu 'xem việc ĐÃ HOÀN THÀNH', 'xem việc đã xong' -> Dùng `xem_viec_da_hoan_thanh`.",
+            "tool": xem_viec_da_hoan_thanh
+        },
+        
+        # (ƯU TIÊN 2: XEM LỊCH NHẮC)
+        "xem_lich_nhac": {
+            "rule": "(XEM LỊCH NHẮC - ƯU TIÊN 2) Nếu 'input' yêu cầu 'xem lịch nhắc', 'xem nhắc nhở' (phân biệt rõ với 'công việc') -> Dùng `xem_lich_nhac`.",
+            "tool": xem_lich_nhac
+        },
+        # (ƯU TIÊN 3: RAG (FILE/NOTE))
+        "hoi_thong_tin": {
+            "rule": "(HỎI/LỌC - ƯU TIÊN 1) Dùng cho TẤT CẢ các câu HỎI, TÌM KIẾM CÓ LỌC."
+                    "(Ví dụ: 'xem ghi chú server', 'tìm file excel', 'cho tôi pass', 'tôi thích ăn gì?', 'ds file trong cong viec')."
+                    "Tool này là tool HỎI/TÌM chính.",
+            "tool": hoi_thong_tin
+        },
+        
+        # (ƯU TIÊN 4: CÁC LỆNH XEM KHÁC)
+        "xem_bo_nho": {
+            "rule": "(XEM NOTE ĐẦY ĐỦ - ƯU TIÊN 2) CHỈ DÙNG nếu 'input' yêu cầu 'TẤT CẢ', 'TOÀN BỘ' ghi chú."
+                    "(Ví dụ: 'xem tất cả ghi chú', 'liệt kê toàn bộ note')."
+                    "KHÔNG DÙNG nếu 'input' có từ khóa lọc (đã được Ưu tiên 1 xử lý).",
+            "tool": xem_bo_nho
+        },
+        "xem_danh_sach_file": {
+            "rule": "(XEM FILE ĐẦY ĐỦ - ƯU TIÊN 2) CHỈ DÙNG nếu 'input' yêu cầu 'TẤT CẢ', 'TOÀN BỘ' file/ảnh."
+                    "(Ví dụ: 'xem tất cả file', 'liệt kê toàn bộ file')."
+                    "KHÔNG DÙNG nếu 'input' có từ khóa lọc (ví dụ: 'ds file trong cong viec' -> đã được Ưu tiên 1 xử lý).",
+            "tool": xem_danh_sach_file
+        },
+        
+        
+        # (Ưu tiên 2 - Lệnh hỏi/lọc)
         "get_product_detail": base_tools_data["get_product_detail"],
         "searchlistproductnew": base_tools_data["searchlistproductnew"],
         "goi_chart_dashboard": base_tools_data["goi_chart_dashboard"],
         "hien_thi_web": base_tools_data["hien_thi_web"],
-        "xem_viec_chua_hoan_thanh": base_tools_data["xem_viec_chua_hoan_thanh"],
-        "xem_viec_da_hoan_thanh": base_tools_data["xem_viec_da_hoan_thanh"],
-        "xem_lich_nhac": base_tools_data["xem_lich_nhac"],
-        "xem_danh_sach_file": base_tools_data["xem_danh_sach_file"],
-        "hoi_thong_tin": base_tools_data["hoi_thong_tin"],
-        "xem_bo_nho": base_tools_data["xem_bo_nho"],
+       
     }
+    
+    # (Các nhóm khác giữ nguyên)
+    # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
     
     save_tools_data = {
         "luu_thong_tin": base_tools_data["luu_thong_tin"],
@@ -5344,40 +6045,90 @@ async def setup_chat_session(user: cl.User):
     
     all_elements = cl.user_session.get("elements", [])
     cl.user_session.set("elements", all_elements)
-
-# =========================================================
-def _to_video_url(v: str) -> str:
-    if not v:
-        return ""
-    s = str(v).strip()
-    if not s:
-        return ""
-
-    # Nếu là thẻ iframe -> lấy src
-    if s.startswith("<iframe"):
-        m = re.search(r'src="([^"]+)"', s, flags=re.I)
-        return m.group(1) if m else ""
-
-    # Chuẩn hóa YouTube (để ClVideo phát được)
-    s = s.replace("&amp;", "&")
-    try:
-        if "youtube.com/watch" in s or "youtu.be/" in s or "youtube.com/embed/" in s:
-            # ClVideo có thể phát link watch/youtu.be trực tiếp
-            if "youtube.com/embed/" in s:
-                vid = s.split("/embed/")[1].split("?")[0]
-                return f"https://www.youtube.com/watch?v={vid}"
-            return s
-    except Exception:
-        pass
-
-    # File video trực tiếp
-    low = s.lower()
-    if low.endswith((".mp4", ".webm", ".ogg")):
-        return s
-
-    # Mặc định
-    return s
 # (DÁN HÀM MỚI NÀY VÀO KHOẢNG DÒNG 4300, NGAY TRƯỚC @cl.on_message)
+# (DÁN HÀM MỚI NÀY VÀO KHOẢNG DÒNG 4300, 
+#  NGAY TRƯỚC HÀM _llm_split_notes)
+
+async def _llm_batch_split_classify(
+    llm: ChatOpenAI, 
+    user_note: str, 
+    num_files: int
+) -> List[dict]:
+    """
+    (MỚI - SỬA LỖI 79)
+    Một lệnh gọi GPT duy nhất để TÁCH và PHÂN LOẠI
+    cho 'Smart Mode' (khi không có 'vào mục').
+    Trả về list of dicts: 
+    [{"name": "...", "key": "...", "label": "..."}, ...]
+    """
+    
+    prompt = f"""
+    Ghi chú của người dùng: "{user_note}"
+    Số lượng file đã upload: {num_files}
+
+    Nhiệm vụ: 
+    1. Phân tích Ghi chú để tìm ra ngữ cảnh chung (ví dụ: 'công việc').
+    2. Tách Ghi chú thành chính xác {num_files} TÊN (name) riêng lẻ.
+    3. Trả về MỖI file trên MỘT DÒNG theo định dạng:
+       `Ten file da tach | fact_key (snake_case) | Fact Label (Tieng Viet)`
+
+    QUY TẮC:
+    - Phải trả về ĐÚNG {num_files} dòng.
+    - PHẢI áp dụng ngữ cảnh chung (ví dụ: 'cong viec') cho TẤT CẢ các dòng.
+    - KHÔNG giải thích.
+
+    Ví dụ 1:
+    Ghi chú: "luu file ns 2024 và ns 2025 vao cong viec"
+    Số lượng file: 2
+    Output:
+    file ns 2024 | cong_viec | Công Việc
+    file ns 2025 | cong_viec | Công Việc
+
+    Ví dụ 2:
+    Ghi chú: "anh cccd mat truoc va mat sau vao ho so ca nhan"
+    Số lượng file: 2
+    Output:
+    anh cccd mat truoc | ho_so_ca_nhan | Hồ Sơ Cá Nhân
+    anh cccd mat sau | ho_so_ca_nhan | Hồ Sơ Cá Nhân
+    
+    Ví dụ 3 (Fallback - Không có ngữ cảnh):
+    Ghi chú: "hai file linh tinh"
+    Số lượng file: 2
+    Output:
+    hai file linh tinh 1 | general | General
+    hai file linh tinh 2 | general | General
+    """
+    
+    results = []
+    try:
+        resp = await llm.ainvoke(prompt)
+        lines = [line.strip() for line in resp.content.strip().split('\n') if line.strip()]
+        
+        if len(lines) == num_files:
+            print(f"✅ [LLM Batch Split] (Sửa lỗi 79) GPT đã tách và phân loại {len(lines)} mục.")
+            for line in lines:
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    results.append({
+                        "name": parts[0].strip(),
+                        "key": parts[1].strip(),
+                        "label": parts[2].strip()
+                    })
+                else:
+                    # Lỗi parse dòng
+                    results.append({"name": line, "key": "general", "label": "General"})
+            return results
+        
+        # Nếu GPT trả về sai số lượng -> Fallback
+        print(f"⚠️ [LLM Batch Split] (Sửa lỗi 79) GPT trả về {len(lines)} dòng (mong đợi {num_files}). Dùng fallback.")
+
+    except Exception as e:
+        print(f"❌ Lỗi _llm_batch_split_classify: {e}. Dùng fallback.")
+
+    # Trả về list rỗng để kích hoạt fallback
+    return []
+
+
 async def _llm_split_notes(llm: ChatOpenAI, user_note: str, num_files: int) -> List[str]:
     """
     (MỚI - THEO Ý TƯỞNG CỦA USER)
@@ -5438,11 +6189,19 @@ async def _llm_split_notes(llm: ChatOpenAI, user_note: str, num_files: int) -> L
     except Exception as e:
         print(f"❌ Lỗi _llm_split_notes: {e}. Dùng fallback.")
         return [user_note] * num_files
-# (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 4330)
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 4310)
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 4310)
 @cl.on_message
 async def on_message(message: cl.Message):
     """
-    (SỬA LỖI 45: Xóa bỏ check 'agent_executor' cũ)
+    (SỬA LỖI 79)
+    1. (Album Mode) Giữ nguyên (Sửa lỗi 78).
+    2. (Smart Mode) Dùng _llm_batch_split_classify (1 GPT call).
+    3. (Smart Mode - Fallback) Nếu (2) thất bại, quay lại
+       logic N+1 call (V78) để đảm bảo an toàn.
+    (SỬA LỖI 77)
+    Tất cả các hàm lưu file (_save_... , _load_...)
+    đã được cập nhật để xử lý 'entry_type' (master/chunk).
     """
     import json
     import traceback
@@ -5460,7 +6219,7 @@ async def on_message(message: cl.Message):
             return
 
         print(f"[on_message] User={user_id_str} Session={session_id} text={text!r}")
-        chat_history = cl.user_session.get("chat_history", []) # <-- THÊM LẠI DÒNG NÀY
+        chat_history = cl.user_session.get("chat_history", []) 
         try:
             user_id_str_esc = cl.user_session.get("user_id_str")
             if user_id_str_esc in ACTIVE_ESCALATIONS:
@@ -5476,8 +6235,6 @@ async def on_message(message: cl.Message):
         elements = message.elements or []
         vectorstore = cl.user_session.get("vectorstore")
 
-        # --- 🚀 BẮT ĐẦU SỬA LỖI 33 (Ý TƯỞNG CỦA BẠN) 🚀 ---
-
         if elements and vectorstore:
             # NHÁNH A: XỬ LÝ FILE/IMAGE (LOGIC MỚI)
             try:
@@ -5490,58 +6247,226 @@ async def on_message(message: cl.Message):
                     fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
                     saved_files_summary_lines = []
                     num_files = len(elements)
-                    notes_for_files = []
+                    
+                    # --- 🚀 BẮT ĐẦU LOGIC MỚI (V79) 🚀 ---
+                    
+                    notes_for_files = []      # Ghi chú gốc (luu anh...)
+                    keys_for_files = []       # Key (ho_so_benh_an)
+                    labels_for_files = []     # Label (Hồ Sơ Bệnh Án)
+                    clean_names_for_files = [] # Name (ho so benh...)
+                    
+                    album_match = re.match(r"^(.*?)\s+(vào mục|vào)\s+(.*?)\s*$", text, re.IGNORECASE | re.DOTALL)
+                    
+                    existing_keys = []
+                    for d in fact_dict.values():
+                        if isinstance(d, dict):
+                            existing_keys.append(d.get('key', 'general'))
+                        elif isinstance(d, str):
+                            existing_keys.append(d)
+                    existing_keys = list(set(existing_keys))
+                    
+                    if album_match:
+                        # --- NHÁNH A.1: CHẾ ĐỘ ALBUM (Giữ nguyên Sửa lỗi 78) ---
+                        print(f"✅ [Album Mode] Phát hiện 'vào mục'. Đang gọi LLM phân tích: '{text}'")
 
-                    # BƯỚC A: LẤY GHI CHÚ
-                    if text and num_files > 0:
-                        # (MỚI) DÙNG LLM TÁCH GHI CHÚ
-                        print(f"[FactKey] (Tách) Đang gọi LLM tách ghi chú: '{text}' cho {num_files} file.")
-                        notes_for_files = await _llm_split_notes(llm, text, num_files)
-                    else:
-                        # (FALLBACK) Dùng tên file (logic cũ của tôi)
-                        print("[FactKey] (Fallback) Không có ghi chú, dùng tên file.")
-                        notes_for_files = [os.path.splitext(el.name)[0].replace("-", " ").replace("_", " ") for el in elements]
+                        # 1. (CŨ) Tạo Prompt thông minh (VẪN DÙNG)
+                        album_prompt = f"""
+Bạn là một trợ lý phân tích. Câu lệnh của người dùng có 2 phần: (A) Tên/ghi chú của file, và (B) Danh mục muốn lưu vào.
+Câu lệnh: "{text}"
+Ví dụ 1:
+Câu lệnh: "lưu ds 2022 vào cong viec cua toi"
+Output:
+Doanh số 2022 | cong_viec | Công Việc
+Ví dụ 2:
+Câu lệnh: "anh cccd mt vào thong tin ca nhan"
+Output:
+Ảnh CCCD mặt trước | thong_tin_ca_nhan | Thông Tin Cá Nhân
+Nhiệm vụ: Trả về 3 phần (Tên File Đã Mở Rộng | fact_key | fact_label).
+KHÔNG giải thích. Chỉ trả về 1 dòng theo định dạng `Name | Key | Label`.
+Output:
+"""
+                        
+                        # 2. (CŨ) Gọi LLM (VẪN DÙNG)
+                        resp = await llm.ainvoke(album_prompt)
+                        raw_output = resp.content.strip().strip("`'\"")
+                        
+                        # 3. (CŨ) Parse kết quả (VẪN DÙNG)
+                        summary_name = "File đã lưu" # Tên dự phòng
+                        forced_key = "general"
+                        forced_label = "General"
+                        
+                        if "|" in raw_output:
+                            parts = raw_output.split("|")
+                            if len(parts) >= 3:
+                                summary_name = parts[0].strip() or summary_name
+                                forced_key = parts[1].strip() or forced_key
+                                forced_label = parts[2].strip() or forced_label
 
-                    # BƯỚC B: LẶP QUA TỪNG FILE + GHI CHÚ ĐÃ TÁCH
-                    # (Dùng zip để gán file 1 -> note 1, file 2 -> note 2)
-                    for el, user_note_for_file in zip(elements, notes_for_files):
+                        print(f"✅ [Album Mode] LLM đã phân tích: Key='{forced_key}' | Label='{forced_label}'")
+
+                        # 4. (CŨ) Cập nhật Cache (VẪN DÙNG)
                         try:
-                            user_note_clean = user_note_for_file.strip().lower()
+                            key_name_raw = album_match.group(3).strip() # 'muc cong viec'
+                            note_part_raw = album_match.group(1).strip() # 'luu file ns 2024...'
                             
-                            # BƯỚC C: LẤY KEY CHO TỪNG FILE
-                            existing_keys = list(set(fact_dict.values()))
+                            fact_dict[text.strip().lower()] = {"key": forced_key, "label": forced_label} # 'luu...vao muc...'
+                            fact_dict[key_name_raw.strip().lower()] = {"key": forced_key, "label": forced_label} # 'muc cong viec'
+                            fact_dict[note_part_raw.strip().lower()] = {"key": forced_key, "label": forced_label} # 'luu file ns 2024...'
                             
-                            print(f"[FactKey] (File: {el.name}) Đang gọi LLM (v27) phân loại ghi chú: '{user_note_for_file}'")
-                            # (Gọi v27 - đã sửa ở Bước 1)
-                            fact_key = await call_llm_to_classify(llm, user_note_for_file, existing_keys)
+                            print(f"[Album Mode] Đã cập nhật cache (3 keys) cho Key: '{forced_key}'")
+                        except Exception: 
+                            fact_dict[text.strip().lower()] = {"key": forced_key, "label": forced_label}
+                            print(f"[Album Mode] Đã cập nhật cache (1 key) cho Key: '{forced_key}'")
+
+                        # 5. (CŨ - Sửa lỗi 78) Gán giá trị
+                        keys_for_files = [forced_key] * num_files
+                        labels_for_files = [forced_label] * num_files
+                        notes_for_files = [text] * num_files 
+                        
+                        note_part_to_split = album_match.group(1).strip() 
+                        print(f"✅ [Album Mode] (Sửa lỗi 78) Đang gọi _llm_split_notes để tách tên từ: '{note_part_to_split}'")
+                        clean_names_for_files = await _llm_split_notes(llm, note_part_to_split, num_files)
+                        
+                        if len(clean_names_for_files) != num_files:
+                            clean_names_for_files = [f"{summary_name} ({i+1})" for i in range(num_files)]
+                            print(f"⚠️ [Album Mode] (Sửa lỗi 78) Tách tên thất bại, dùng tên chung: '{summary_name}'")
+
+                    else:
+                        # --- NHÁNH A.2: CHẾ ĐỘ SMART (SỬA LỖI 79) ---
+                        print(f"[Smart Mode] (Sửa lỗi 79) Không phát hiện 'vào mục'. Đang gọi Batch Split...")
+                        
+                        # 1. (MỚI) Gọi hàm Batch (1 GPT call)
+                        batch_results = []
+                        if text: # Chỉ chạy nếu có ghi chú
+                            batch_results = await _llm_batch_split_classify(llm, text, num_files)
+                        
+                        if batch_results:
+                            # --- (THÀNH CÔNG) ---
+                            print("✅ [Smart Mode] (Sửa lỗi 79) Batch Split thành công.")
+                            for res in batch_results:
+                                clean_names_for_files.append(res["name"])
+                                keys_for_files.append(res["key"])
+                                labels_for_files.append(res["label"])
+                                notes_for_files.append(text) # Dùng ghi chú GỐC
+                                
+                                # (Cập nhật cache)
+                                fact_dict[res["name"].strip().lower()] = {"key": res["key"], "label": res["label"]}
+                        else:
+                            # --- (THẤT BẠI - FALLBACK về V78) ---
+                            print("⚠️ [Smart Mode] (Sửa lỗi 79) Batch Split thất bại. Quay về logic Fallback (N+1 call).")
                             
-                            # Cập nhật cache (trong vòng lặp, để key mới có thể được dùng cho file sau)
-                            fact_dict[user_note_clean] = fact_key
-                            print(f"[FactKey] (File: {el.name}) LLM trả về: '{fact_key}'.")
-                            
-                            # BƯỚC D: LƯU FILE (với note và key TƯƠNG ỨNG)
-                            if "image" in getattr(el, "mime", ""):
-                                _, name = await asyncio.to_thread(
-                                    _save_image_and_note, vectorstore, el.path, user_note_for_file, el.name, fact_key
-                                )
-                                saved_files_summary_lines.append(f"✅ Đã lưu ảnh: **{name}** (Ghi chú: '{user_note_for_file}' | Key: {fact_key})")
+                            if text and num_files > 0:
+                                notes_for_files = await _llm_split_notes(llm, text, num_files)
+                                clean_names_for_files = notes_for_files # Dùng chung
                             else:
+                                notes_for_files = [os.path.splitext(el.name)[0].replace("-", " ").replace("_", " ") for el in elements]
+                                clean_names_for_files = notes_for_files # Dùng chung
+                            
+                            labels_for_files = [] 
+                            
+                            for temp_note in notes_for_files:
+                                temp_note_clean = temp_note.strip().lower()
+                                
+                                cached_data = fact_dict.get(temp_note_clean)
+                                fact_key, fact_label = None, None
+                                
+                                if isinstance(cached_data, dict):
+                                    fact_key = cached_data.get("key")
+                                    fact_label = cached_data.get("label")
+                                elif isinstance(cached_data, str):
+                                    fact_key = cached_data
+                                
+                                if not fact_key or not fact_label:
+                                    # (N+1 call)
+                                    fact_key, fact_label, _ = await call_llm_to_classify(llm, temp_note, existing_keys) 
+                                    fact_dict[temp_note_clean] = {"key": fact_key, "label": fact_label} 
+                                
+                                keys_for_files.append(fact_key)
+                                labels_for_files.append(fact_label) 
+                    
+                    # --- 🚀 KẾT THÚC LOGIC MỚI (V79) 🚀 ---
+
+                    # BƯỚC B: LẶP QUA TỪNG FILE
+                    for i, (el, user_note_for_file, fact_key_for_file, fact_label_for_file, clean_name_for_file) in enumerate(zip(elements, notes_for_files, keys_for_files, labels_for_files, clean_names_for_files)): 
+                        # (THAY THẾ TOÀN BỘ KHỐI TRY/EXCEPT XỬ LÝ FILE - KHOẢNG DÒNG 4468-4501)
+                        try:
+                            display_name = clean_name_for_file
+                            if (not text) and (not clean_name_for_file) and num_files > 1:
+                                display_name = f"{el.name} ({i+1})"
+                            
+                            # --- 🚀 BẮT ĐẦU SỬA LỖI (CHỐNG TRÀN TOKEN V85) 🚀 ---
+                            
+                            # BƯỚC C.1: KIỂM TRA Ý ĐỊNH (ĐỌC/LƯU)
+                            # (Kiểm tra ghi chú GỐC 'text', không phải 'user_note_for_file' đã bị tách)
+                            user_intent_text = text.lower()
+                            keywords_for_chunking = ["đọc", "doc", "phan tich", "index", "noi dung", "chunk"]
+                            
+                            # (MỚI) Mặc định là KHÔNG chunk
+                            should_chunk_file = False
+                            
+                            # (MỚI) Chỉ chunk nếu GHI CHÚ GỐC có từ khóa
+                            if any(keyword in user_intent_text for keyword in keywords_for_chunking):
+                                should_chunk_file = True
+
+                            # BƯỚC C.2: CHỌN HÀM PHÙ HỢP
+                            
+                            if "image" in getattr(el, "mime", ""):
+                                # (1) LƯU ẢNH (Không đổi)
+                                _, name = await asyncio.to_thread(
+                                    _save_image_and_note, 
+                                    vectorstore, 
+                                    el.path, 
+                                    user_note_for_file, # user_text (note=)
+                                    display_name,       # original_name (name=)
+                                    fact_key_for_file,
+                                    fact_label_for_file 
+                                )
+                                saved_files_summary_lines.append(f"✅ Đã xử lý ảnh: **{name}** (Ghi chú: '{user_note_for_file}' | Label: {fact_label_for_file})")
+                            
+                            elif should_chunk_file:
+                                # (2) LƯU + ĐỌC FILE (Logic cũ - Dành cho file nhỏ)
+                                print(f"ℹ️ [Chunker] Phát hiện từ khóa '{user_intent_text}'. Đang gọi _load_and_process_document...")
                                 chunks, name = await asyncio.to_thread(
-                                    _load_and_process_document, vectorstore, el.path, el.name, el.mime, user_note_for_file, fact_key
+                                    _load_and_process_document, 
+                                    vectorstore, 
+                                    el.path, 
+                                    display_name,       # original_name (name=)
+                                    el.mime, 
+                                    user_note_for_file, # user_note (ghi chú)
+                                    fact_key_for_file,
+                                    fact_label_for_file
                                 )
                                 if chunks > 0:
-                                    saved_files_summary_lines.append(f"✅ Đã xử lý file: **{name}** ({chunks} chunks | Key: {fact_key})")
+                                    saved_files_summary_lines.append(f"✅ Đã XỬ LÝ & ĐỌC file: **{name}** ({chunks} chunks | Label: {fact_label_for_file})")
                                 else:
-                                    saved_files_summary_lines.append(f"✅ Đã lưu file: **{name}** (Key: {fact_key})")
+                                    # (Trường hợp này _load_and_process_document tự gọi _save_file_and_note)
+                                    saved_files_summary_lines.append(f"✅ Đã LƯU (nhưng không đọc được): **{name}** (Label: {fact_label_for_file})")
+                            
+                            else:
+                                # (3) (MỚI) CHỈ LƯU FILE (Bookmark)
+                                print(f"ℹ️ [Chunker] KHÔNG phát hiện từ khóa. Chỉ gọi _save_file_and_note (Bookmark)...")
+                                _, name = await asyncio.to_thread(
+                                    _save_file_and_note,
+                                    vectorstore,
+                                    el.path,
+                                    display_name,
+                                    user_note_for_file,
+                                    fact_key_for_file,
+                                    fact_label_for_file,
+                                    _get_simple_file_type(el.mime, el.path) # (Thêm file_type)
+                                )
+                                saved_files_summary_lines.append(f"✅ Đã LƯU (Bookmark): **{name}** (Ghi chú: '{user_note_for_file}' | Label: {fact_label_for_file})")
+
+                            # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
                                     
                         except Exception as e_file:
                             saved_files_summary_lines.append(f"❌ Lỗi xử lý file {getattr(el,'name','?')}: {e_file}")
 
                     # BƯỚC E: LƯU CACHE (1 LẦN)
-                    await asyncio.to_thread(save_user_fact_dict, user_id_str, fact_dict)
+                    await asyncio.to_thread(save_user_fact_dict, user_id_str, fact_dict) 
                     
                     ai_output = (
-                        f"**Kết quả xử lý file (đã tách riêng):**\n\n"
+                        f"**Kết quả xử lý file:**\n\n"
                         + "\n".join(saved_files_summary_lines)
                     )
 
@@ -5549,15 +6474,11 @@ async def on_message(message: cl.Message):
                 ai_output = f"❌ Lỗi nghiêm trọng khi xử lý file: {e_branch_a}"
                 traceback.print_exc()
 
-        # --- 🚀 KẾT THÚC SỬA LỖI 33 🚀 ---
-
         else:
-            # --- 🚀 BẮT ĐẦU SỬA LỖI 44 (SỬ DỤNG ROUTER 2 BƯỚC) 🚀 ---
-            # NHÁNH B: XỬ LÝ TEXT (LOGIC MỚI)
+            # NHÁNH B: XỬ LÝ TEXT (LOGIC ROUTER V44 - KHÔNG ĐỔI)
             try:
                 loading_msg_to_remove = await cl.Message(author="Trợ lý", content="Đang phân tích ý định...").send()
                 
-                # === BƯỚC 1: GỌI MASTER ROUTER (GPT BRAIN) ===
                 master_router_chain = cl.user_session.get("master_router_chain")
                 if not master_router_chain:
                     ai_output = "❌ Lỗi: Mất Master Router (v44). Vui lòng F5."
@@ -5565,12 +6486,11 @@ async def on_message(message: cl.Message):
                     print(f"[Router v44] B1: Đang gọi Master Router phân loại: '{text}'")
                     
                     intent = await master_router_chain.ainvoke({"input": text})
-                    intent = intent.strip().upper() # (Vd: "ASKING")
+                    intent = intent.strip().upper() 
                     
                     print(f"[Router v44] B1: Master Router trả về Intent: '{intent}'")
-                    await loading_msg_to_remove.remove() # Xóa tin nhắn "Đang phân tích..."
+                    await loading_msg_to_remove.remove() 
                     
-                    # === BƯỚC 2: GỌI SUB-AGENT CHUYÊN BIỆT ===
                     target_agent = None
                     if intent == "ASKING":
                         target_agent = cl.user_session.get("agent_ASK")
@@ -5587,9 +6507,6 @@ async def on_message(message: cl.Message):
 
                     if target_agent:
                         
-                        # --- 🚀 BẮT ĐẦU SỬA LỖI (DỊCH INTENT - V46) 🚀 ---
-                        
-                        # 1. (MỚI) Tạo map dịch
                         intent_map_vn = {
                             "ASKING": "Hỏi/Tìm",
                             "SAVING": "Lưu/Tạo",
@@ -5597,22 +6514,16 @@ async def on_message(message: cl.Message):
                             "ADMIN": "Quản trị",
                             "DEBUG": "Gỡ lỗi"
                         }
-                        
-                        # 2. (MỚI) Lấy tên tiếng Việt (hoặc dùng tên gốc nếu không khớp)
                         intent_vn = intent_map_vn.get(intent, intent) 
                         
-                        # 3. (SỬA) Dùng 'intent_vn' và văn bản mới theo yêu cầu của bạn
                         loading_msg_to_remove = await cl.Message(
                             author="Trợ lý", 
                             content=f"Đang thực hiện tác vụ (Ý định: {intent_vn})..."
                         ).send()
                         
-                        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
-                        
                         payload = {"input": text}
-                        result = await target_agent.ainvoke(payload) # <-- Gọi Agent chuyên biệt
+                        result = await target_agent.ainvoke(payload) 
                         
-                        # (Logic giải nén kết quả (giống như cũ))
                         steps = result.get("intermediate_steps") or []
                         if steps and isinstance(steps[-1], tuple) and len(steps[-1]) > 1:
                             obs = steps[-1][1]
@@ -5620,12 +6531,12 @@ async def on_message(message: cl.Message):
                         else:
                             ai_output = result.get("output", "⚠️ Không có phản hồi (output rỗng).")
                     
-                    elif not ai_output: # (Nếu intent không hợp lệ VÀ chưa có lỗi)
+                    elif not ai_output: 
                         ai_output = f"⚠️ Lỗi: Không tìm thấy Agent cho Intent '{intent}'."
             
             except Exception as e_branch_b:
                 ai_output = f"❌ Lỗi gọi agent (v44): {e_branch_b}"
-            # --- 🚀 KẾT THÚC SỬA LỖI 44 🚀 ---
+            # --- KẾT THÚC XỬ LÝ TEXT ---
 
         # ----- 4) TRẢ LỜI & LƯU (Không đổi) -----
         if loading_msg_to_remove:
@@ -5675,6 +6586,7 @@ async def on_message(message: cl.Message):
         await cl.Message(content=f"⚠️ Lỗi không mong muốn (main): {e_main}").send()
         import traceback
         traceback.print_exc()
+
 
 @cl.action_callback("play_video")
 async def on_play_video(action: cl.Action):
