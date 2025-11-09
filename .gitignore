@@ -1,5 +1,14 @@
 .venv/
+.venv311/
 __pycache__/
+# Ignore runtime, caches and sensitive files
 sessions/
 .env
-# removed memory_db/ so DB folders can be committed as requested
+
+# Ignore data and DB directories (do not push data to remote)
+memory_db/
+mem_db/
+chroma_db/
+data/
+user_data/vector_db/
+public/files/
