@@ -1159,18 +1159,20 @@ def _mark_task_complete_db(task_id: int, user_email: str) -> bool:
 def _get_tasks_from_db(
     user_email: str, 
     status: str = "uncompleted",
-    start_date: Optional[datetime] = None, # <-- MỚI
-    end_date: Optional[datetime] = None   # <-- MỚI
+    start_date: Optional[datetime] = None, 
+    end_date: Optional[datetime] = None   
 ) -> List[dict]:
     """
-    (SỬA LỖI) (SYNC) Lấy danh sách công việc, có thể lọc theo NGÀY HẾT HẠN.
+    (SỬA LỖI V94 - SẮP XẾP THEO NGÀY TẠO)
+    Lấy danh sách công việc.
     status: 'uncompleted', 'completed', 'all'
     """
     conn = _get_user_db_conn()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    base_query = "SELECT id, title, description, due_date, recurrence_rule, is_completed FROM user_tasks WHERE user_email = ?"
+    # (Bảng 'user_tasks' đã có 'created_at' (dòng 403))
+    base_query = "SELECT id, title, description, due_date, recurrence_rule, is_completed, created_at FROM user_tasks WHERE user_email = ?"
     params = [user_email.lower()]
     
     if status == "uncompleted":
@@ -1178,19 +1180,23 @@ def _get_tasks_from_db(
     elif status == "completed":
         base_query += " AND is_completed = 1"
     
-    # --- 🚀 BẮT ĐẦU SỬA LỖI (LỌC NGÀY) 🚀 ---
     if start_date:
         base_query += " AND due_date >= ?"
         params.append(start_date)
         
     if end_date:
-        # (Lấy đến cuối ngày đó)
         safe_end_date = end_date.replace(hour=23, minute=59, second=59)
         base_query += " AND due_date <= ?" 
         params.append(safe_end_date)
-    # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
         
-    base_query += " ORDER BY due_date ASC"
+    # --- 🚀 SỬA LỖI V94 (SẮP XẾP THEO YÊU CẦU CỦA BẠN) 🚀 ---
+    if status == "uncompleted":
+        # CHƯA HOÀN THÀNH: Sắp xếp theo HẠN CHÓT (Cũ nhất lên đầu)
+        base_query += " ORDER BY due_date ASC"
+    else:
+        # ĐÃ HOÀN THÀNH (hoặc ALL): Sắp xếp theo NGÀY TẠO (Mới nhất lên đầu)
+        base_query += " ORDER BY created_at DESC"
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
         
     cursor.execute(base_query, params)
     tasks = [dict(row) for row in cursor.fetchall()]
@@ -1929,10 +1935,7 @@ def _save_image_and_note(
     fact_label: str = "General" 
 ) -> Tuple[str, str]:
     """
-    (SỬA LỖI 77)
-    1. (Cũ - 76) Tạo chuỗi [IMAGE]... (lưu vào metadata).
-    2. (Cũ - 76) Tạo chuỗi "sạch" (Label | Name | Note) để VECTORIZE.
-    3. (MỚI - 77) Thêm metadata 'entry_type': 'file_master'.
+    (SỬA LỖI V94 - THÊM TIMESTAMP)
     """
     name = original_name or os.path.basename(src_path) or f"image-{uuid.uuid4().hex[:6]}"
     ext = os.path.splitext(name)[1]
@@ -1940,8 +1943,6 @@ def _save_image_and_note(
     
     dst = os.path.join(PUBLIC_FILES_DIR, safe_name) 
     shutil.copyfile(src_path, dst)
-    
-    # --- 🚀 BẮT ĐẦU SỬA LỖI 77 🚀 ---
     
     original_content_str = f"[IMAGE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
     vector_text_str = f"{fact_label} | {name} | {user_text.strip() or '(no note)'}"
@@ -1951,14 +1952,13 @@ def _save_image_and_note(
         "fact_label": fact_label, 
         "file_type": "image",
         "original_content": original_content_str, 
-        "entry_type": "file_master" # <-- (MỚI) ĐÂY LÀ FILE GỐC
+        "entry_type": "file_master",
+        "timestamp": datetime.now(VN_TZ).isoformat() # <-- 🚀 SỬA LỖI V94
     }
     
     vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
-    # --- 🚀 KẾT THÚC SỬA LỖI 77 🚀 ---
     
     return dst, name
-
 
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1700)
 def _save_file_and_note(
@@ -1971,11 +1971,7 @@ def _save_file_and_note(
     file_type: str = "file" 
 ) -> Tuple[str, str]:
     """
-    (SỬA LỖI 76)
-    1. Tạo chuỗi [FILE]... để HIỂN THỊ (lưu vào metadata).
-    2. Tạo chuỗi "sạch" (Label | Name | Note) để VECTORIZE.
-    (SỬA LỖI 80)
-    3. Thêm metadata 'entry_type': 'file_master'.
+    (SỬA LỖI V94 - THÊM TIMESTAMP)
     """
     name = original_name or os.path.basename(src_path) or f"file-{uuid.uuid4().hex[:6]}"
     ext = os.path.splitext(name)[1]
@@ -1984,31 +1980,21 @@ def _save_file_and_note(
     dst = os.path.join(PUBLIC_FILES_DIR, safe_name)
     shutil.copyfile(src_path, dst)
     
-    # --- 🚀 BẮT ĐẦU SỬA LỖI 76 🚀 ---
-    
-    # 1. Chuỗi Hiển thị Gốc
     original_content_str = f"[FILE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
-    
-    # 2. Chuỗi "Sạch" (Để tạo Vector)
     vector_text_str = f"{fact_label} | {name} | {user_text.strip() or '(no note)'}"
     
-    # 3. Metadata (Chứa chuỗi gốc)
     metadata = {
         "fact_key": fact_key, 
         "fact_label": fact_label, 
         "file_type": file_type,
-        "original_content": original_content_str, # <-- LƯU CHUỖI GỐC VÀO ĐÂY
-        "entry_type": "file_master" # <-- 🚀 SỬA LỖI 80 (THÊM DÒNG NÀY)
+        "original_content": original_content_str, 
+        "entry_type": "file_master",
+        "timestamp": datetime.now(VN_TZ).isoformat() # <-- 🚀 SỬA LỖI V94
     }
     
-    # 4. Lưu (Vectorize chuỗi "sạch")
     vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
     
-    # --- 🚀 KẾT THÚC SỬA LỖI 76 🚀 ---
-    
     return dst, name
-
-
 def _get_text_splitter() -> RecursiveCharacterTextSplitter:
     """Tạo một text splitter tiêu chuẩn."""
     return RecursiveCharacterTextSplitter(
@@ -2029,14 +2015,17 @@ def _load_and_process_document(
     fact_label: str = "General" 
 ) -> Tuple[int, str]:
     """
-    (SỬA LỖI 77)
-    1. (MỚI) Xử lý FILE_UNSUPPORTED/ERROR -> 'entry_type': 'file_master'.
-    2. (MỚI) Xử lý CHUNKS -> 'entry_type': 'file_chunk'.
+    (SỬA LỖI V94 - THÊM TIMESTAMP)
+    1. (V94) Thêm timestamp vào CHUNKS.
+    2. (V94) Thêm timestamp vào FILE_UNSUPPORTED/ERROR.
     """
     
     simple_file_type = _get_simple_file_type(mime_type, src_path)
     metadata_note = f"Trích từ tài liệu: {original_name} | Ghi chú của người dùng: {user_note}"
     text_content = ""
+    
+    # (SỬA LỖI V94) Lấy timestamp 1 lần
+    current_timestamp_iso = datetime.now(VN_TZ).isoformat()
 
     try:
         # 1. Đọc nội dung (logic không đổi)
@@ -2059,7 +2048,7 @@ def _load_and_process_document(
             with open(src_path, "r", encoding="utf-8") as f:
                 text_content = f.read()
         else:
-            # --- 🚀 BẮT ĐẦU SỬA LỖI 77 (FILE KHÔNG HỖ TRỢ) 🚀 ---
+            # --- (FILE KHÔNG HỖ TRỢ) ---
             original_content_str = f"[FILE_UNSUPPORTED] path={src_path} | name={original_name} | note={user_note}"
             vector_text_str = f"{fact_label} | {original_name} | {user_note} | File không hỗ trợ"
             metadata = {
@@ -2067,11 +2056,12 @@ def _load_and_process_document(
                 "fact_label": fact_label, 
                 "file_type": simple_file_type,
                 "original_content": original_content_str,
-                "entry_type": "file_master" # <-- (MỚI) ĐÂY LÀ FILE GỐC
+                "entry_type": "file_master",
+                "timestamp": current_timestamp_iso # <-- 🚀 SỬA LỖI V94
             }
             vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
-            # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
             
+            # (Hàm _save_file_and_note đã được sửa V94)
             _save_file_and_note(vectorstore, src_path, original_name, user_note, fact_key, fact_label, simple_file_type) 
             return 0, original_name
             
@@ -2086,21 +2076,22 @@ def _load_and_process_document(
             for chunk in chunks
         ]
 
-        # --- 🚀 BẮT ĐẦU SỬA LỖI 77 (LƯU CHUNKS) 🚀 ---
+        # --- (LƯU CHUNKS) ---
         chunk_metadatas = [{
             "file_type": simple_file_type, 
             "fact_label": fact_label, 
             "fact_key": fact_key,
-            "entry_type": "file_chunk" # <-- (MỚI) ĐÂY LÀ MẢNH
+            "entry_type": "file_chunk",
+            "timestamp": current_timestamp_iso # <-- 🚀 SỬA LỖI V94
         } for _ in chunks_with_metadata] 
         
         vectorstore.add_texts(
             texts=chunks_with_metadata, 
             metadatas=chunk_metadatas
         )
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+        # --- KẾT THÚC LƯU CHUNKS ---
         
-        # 5. Lưu bản ghi [FILE] (Hàm này đã được sửa Sửa lỗi 77 ở trên)
+        # 5. Lưu bản ghi [FILE] (Hàm này đã được sửa V94)
         _save_file_and_note(vectorstore, src_path, original_name, user_note, fact_key, fact_label, simple_file_type)
         
         return len(chunks_with_metadata), original_name
@@ -2108,7 +2099,7 @@ def _load_and_process_document(
     except Exception as e:
         print(f"[ERROR] _load_and_process_document failed: {e}")
         
-        # --- 🚀 BẮT ĐẦU SỬA LỖI 77 (LƯU LỖI) 🚀 ---
+        # --- (LƯU LỖI) ---
         original_content_str = f"[ERROR_PROCESSING_FILE] name={original_name} | note={user_note} | error={e}"
         vector_text_str = f"{fact_label} | {original_name} | {user_note} | Lỗi xử lý file"
         metadata = {
@@ -2116,14 +2107,13 @@ def _load_and_process_document(
             "fact_label": fact_label, 
             "file_type": simple_file_type,
             "original_content": original_content_str,
-            "entry_type": "file_master" # <-- (MỚI) ĐÂY LÀ FILE GỐC
+            "entry_type": "file_master",
+            "timestamp": current_timestamp_iso # <-- 🚀 SỬA LỖI V94
         }
         vectorstore.add_texts(texts=[vector_text_str], metadatas=[metadata])
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
+        # --- KẾT THÚC LƯU LỖI ---
         
         raise
-    
-    
 # =========================================================
 # 🧩 Tiện ích xem bộ nhớ (Đã sửa đổi)
 # =========================================================
@@ -2140,14 +2130,14 @@ def dump_all_memory_texts(vectorstore: Chroma) -> str: # <-- SỬA
 
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1868)
 def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
-    """SỬA ĐỔI (SỬA LỖI 80): Quét ChromaDB của user
+    """
+    (SỬA LỖI V94 - LẤY TIMESTAMP)
+    Quét ChromaDB của user
     Lọc bằng metadata['file_type'] != 'text'
     Đọc dữ liệu từ metadata['original_content']
     """
     out = []
     try:
-        # SỬA: Lọc theo metadata['file_type'] KHÁC 'text'
-        # VÀ LẤY CẢ metadatas
         data = vectorstore._collection.get(
             where={"file_type": {"$ne": "text"}},
             include=["documents", "metadatas"] 
@@ -2155,15 +2145,13 @@ def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
         
         ids = data.get("ids", [])
         docs = data.get("documents", [])
-        metadatas = data.get("metadatas", []) # <--- LẤY METADATAS
+        metadatas = data.get("metadatas", []) 
         
-        # SỬA: Lặp qua cả 3
         for doc_id, document_text, metadata in zip(ids, docs, metadatas):
             if not metadata: continue
             
-            # SỬA: Đọc từ metadata['original_content']
             content = metadata.get("original_content")
-            if not content: continue # Bỏ qua nếu không có chuỗi gốc
+            if not content: continue 
 
             path_match = re.search(r"path=([^|]+)", content)
             name_match = re.search(r"name=([^|]+)", content)
@@ -2174,15 +2162,16 @@ def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
             user_note = note_match.group(1).strip() if note_match else "(không có)"
             
             saved_name = os.path.basename(file_path)
-            
-            # SỬA: Đọc file_type từ metadata
             file_type_str = metadata.get("file_type", "file")
-            # Chuyển đổi về định dạng [TAG] cũ
+            
             type_tag = f"[{file_type_str.upper()}]"
-            if file_type_str == "image":
-                type_tag = "[IMAGE]"
-            elif file_type_str == "text":
-                 continue # An toàn, mặc dù query $ne đã lọc
+            if file_type_str == "image": type_tag = "[IMAGE]"
+            elif file_type_str == "text": continue 
+            
+            # --- 🚀 SỬA LỖI V94 (LẤY TIMESTAMP) 🚀 ---
+            # (Lấy timestamp, nếu không có thì dùng mốc 0)
+            ts_str = metadata.get("timestamp", "1970-01-01T00:00:00+00:00")
+            # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
             
             out.append({
                 "doc_id": doc_id,
@@ -2190,17 +2179,20 @@ def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
                 "saved_name": saved_name,
                 "original_name": file_name,
                 "note": user_note,
-                "type": type_tag # <--- Dùng type đã đọc
+                "type": type_tag,
+                "timestamp_str": ts_str # <-- (V94) Thêm vào dict
             })
             
     except Exception as e:
         import traceback
-        print("[ERROR] Lỗi nghiêm trọng trong list_active_files (ĐÃ SỬA):")
+        print("[ERROR] Lỗi nghiêm trọng trong list_active_files (V94):")
         print(traceback.format_exc())
         
-    return sorted(out, key=lambda x: (x["original_name"]))
-
-
+    # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
+    # Sắp xếp theo timestamp (mới nhất lên đầu)
+    return sorted(out, key=lambda x: x["timestamp_str"], reverse=True)
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
+    
 
 # =========================================================
 # 🧠 Trích FACT (SỬ DỤNG LLM) - (Hàm mới)
@@ -2252,9 +2244,12 @@ KHÔNG được giải thích.
 # =========================================================
 # 🔔 Push API & Scheduler Helpers (GỘP TỪ CODE CŨ)
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 872)
-
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 900)
 async def ui_show_all_memory():
-    """(MỚI) Hiển thị tất cả ghi chú (trừ file/image) với nút xóa."""
+    """(SỬA LỖI V94 - SẮP XẾP THEO TIMESTAMP)
+    Hiển thị tất cả ghi chú (trừ file/image) 
+    với nút xóa, MỚI NHẤT LÊN ĐẦU.
+    """
     vectorstore = cl.user_session.get("vectorstore")
     if not vectorstore:
         await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
@@ -2262,41 +2257,43 @@ async def ui_show_all_memory():
     
     # Phải chạy sync
     def _get_docs_sync():
-        return vectorstore._collection.get(include=["documents"])
+        return vectorstore._collection.get(
+            where={"file_type": "text"}, # <-- (V94) Chỉ lấy text
+            include=["documents", "metadatas"]
+        )
     
     raw_data = await asyncio.to_thread(_get_docs_sync)
     
     ids = raw_data.get("ids", [])
     docs = raw_data.get("documents", [])
+    metadatas = raw_data.get("metadatas", []) # (V94) Lấy metadatas
     
     if not docs:
         await cl.Message(content="📭 Bộ nhớ đang trống. Chưa lưu gì cả.").send()
         return
 
     notes_found = 0
-    await cl.Message(content="📝 **Các ghi chú đã lưu (Văn bản):**").send()
+    await cl.Message(content="📝 **Các ghi chú đã lưu (Văn bản - Mới nhất lên đầu):**").send()
     
-    for doc_id, content in zip(ids, docs):
+    # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
+    # (Dùng helper V94 đã tạo ở Bước 1)
+    sorted_results = _helper_sort_results_by_timestamp(ids, docs, metadatas)
+    
+    for doc_id, content, metadata in sorted_results:
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
+    
         if not content: continue
         
-        # --- BỘ LỌC ĐẦY ĐỦ ---
-        if content.startswith("[FILE]") or \
-           content.startswith("[IMAGE]") or \
-           content.startswith("[REMINDER_") or \
-           content.startswith("[ERROR_PROCESSING_FILE]") or \
-           content.startswith("[FILE_UNSUPPORTED]") or \
-           content.startswith("Trích từ tài liệu:") or \
-           content.startswith("FACT:"):
+        # (Bộ lọc này giữ nguyên, mặc dù 'where' đã lọc)
+        if content.startswith(("[FILE]", "[IMAGE]", "[REMINDER_", 
+           "[ERROR_PROCESSING_FILE]", "[FILE_UNSUPPORTED]", 
+           "Trích từ tài liệu:", "FACT:")):
             continue
         
         notes_found += 1
         
-        # --- SỬA LỖI UI (DÙNG POPUP) ---
-        
-        # 1. Tạo tin nhắn (chưa gửi)
+        # (Phần UI (Popup) giữ nguyên)
         msg = cl.Message(content="") 
-        
-        # 2. Nút Xóa (Luôn có)
         actions = [
             cl.Action(
                 name="delete_note", 
@@ -2305,34 +2302,25 @@ async def ui_show_all_memory():
             )
         ]
         
-        # 3. Logic hiển thị (Ngắn / Dài)
-        # (Đặt 150 ký tự, hoặc nếu có xuống dòng)
         if len(content) > 150 or "\n" in content:
-            # GHI CHÚ DÀI: Hiển thị tóm tắt và thêm nút "Xem chi tiết"
             summary = "• " + (content.split('\n', 1)[0] or content).strip()[:150] + "..."
             msg.content = summary
-            
-            # Thêm nút MỚI để mở Popup
             actions.append(
                 cl.Action(
-                    name="show_note_detail", # Gọi callback mới
-                    payload={"doc_id": doc_id},    # Chỉ cần doc_id
+                    name="show_note_detail", 
+                    payload={"doc_id": doc_id},
                     label="📄 Xem chi tiết"
                 )
             )
         else:
-            # GHI CHÚ NGẮN: Hiển thị đầy đủ
             msg.content = f"• {content}"
-
-        # 4. Gán action và gửi
-        msg.actions = actionsds
+        
+        msg.actions = actions
         await msg.send()
-        # --- KẾT THÚC SỬA LỖI UI ---
 
     if notes_found == 0:
          await cl.Message(content="📭 Không tìm thấy ghi chú văn bản nào (chỉ có file/lịch nhắc).").send()
-         
-         
+
 # --- Helper: Retry cho Push API ---
 from requests.adapters import HTTPAdapter
 try:
@@ -2979,12 +2967,14 @@ async def _on_show_note_detail(action: cl.Action):
         traceback.print_exc() 
         await cl.Message(content=f"❌ Lỗi khi mở dschi tiết (Debug): {str(e)}").send()
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 872)
+# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1945)
 async def display_interactive_list(where_clause: dict, title: str):
     """
-    (SỬA LỖI 76)
-    1. Lấy "documents" (cho text) VÀ "metadatas" (cho file/image).
-    2. Nếu là file/image -> Lấy chuỗi `[FILE]...` từ `metadata['original_content']`.
-    3. Nếu là text -> Lấy chuỗi "sạch" từ `document`.
+    (SỬA LỖI V94 - SẮP XẾP THEO TIMESTAMP)
+    Hàm "Trái Tim" (V61)
+    1. (Cũ) Lấy "documents" (cho text) VÀ "metadatas" (cho file/image).
+    2. (MỚI) Sắp xếp kết quả bằng helper V94.
+    3. Hiển thị (MỚI NHẤT LÊN ĐẦU).
     """
     
     vectorstore = cl.user_session.get("vectorstore")
@@ -2993,13 +2983,10 @@ async def display_interactive_list(where_clause: dict, title: str):
         return 0 
 
     try:
-        await cl.Message(content=f"**{title}**").send()
+        await cl.Message(content=f"**{title} (Mới nhất lên đầu)**").send() # <-- (V94) Thêm
         
         final_where_for_chroma = where_clause if where_clause else None
         
-        # (SỬA LỖI 76) Chúng ta cần CẢ HAI:
-        # 1. 'documents': Cho Ghi chú (TEXT)
-        # 2. 'metadatas': Cho File/Ảnh (để lấy 'original_content')
         results = await asyncio.to_thread(
             vectorstore._collection.get, 
             where=final_where_for_chroma,
@@ -3017,8 +3004,11 @@ async def display_interactive_list(where_clause: dict, title: str):
 
         found_count = 0
         
-        # 2. Lặp và Hiển thị
-        for doc_id, document_text, metadata in zip(ids, docs, metadatas):
+        # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
+        sorted_results = _helper_sort_results_by_timestamp(ids, docs, metadatas)
+        
+        for doc_id, document_text, metadata in sorted_results:
+        # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
             
             if not metadata: metadata = {}
             file_type = metadata.get("file_type", "text")
@@ -3032,24 +3022,17 @@ async def display_interactive_list(where_clause: dict, title: str):
             )
             actions = []
             
-            # --- 🚀 BẮT ĐẦU SỬA LỖI 76 (ĐỌC FILE/IMAGE) 🚀 ---
+            # (Logic Hiển thị File/Ảnh (V76) giữ nguyên)
             if file_type != "text":
-                
-                # (SỬA) Lấy chuỗi [FILE]... từ metadata
                 content = metadata.get("original_content")
-                
                 if not content:
-                    # (Dự phòng nếu metadata bị lỗi)
                     msg.content = f"Lỗi: {file_type} (ID: {doc_id}) thiếu 'original_content' trong metadata."
                     await msg.send()
                     continue
-                
                 try:
-                    # (Phần còn lại y như cũ, vì nó parse chuỗi 'content')
                     path_match = re.search(r"path=([^|]+)", content)
                     name_match = re.search(r"name=([^|]+)", content)
                     note_match = re.search(r"note=([^|]+)", content)
-
                     if not path_match: continue
                     
                     full_path = path_match.group(1).strip()
@@ -3067,7 +3050,6 @@ async def display_interactive_list(where_clause: dict, title: str):
                         display_content = f"**[{safe_name}]({safe_href})** [{file_type.upper()}]"
                     
                     msg.content = f"{display_content}\n• Ghi chú: *{goc_note}*\n• ID: `{doc_id}`"
-                    
                     actions = [
                         cl.Action(
                             name="delete_file",
@@ -3076,27 +3058,19 @@ async def display_interactive_list(where_clause: dict, title: str):
                         ),
                         edit_action
                     ]
-                    
                 except Exception as e_file:
                     msg.content = f"Lỗi parse file: {e_file}"
-            # --- 🚀 KẾT THÚC SỬA LỖI 76 (ĐỌC FILE/IMAGE) 🚀 ---
-                    
-            # --- 🚀 SỬA LỖI 76 (ĐỌC TEXT) 🚀 ---
+            
+            # (Logic Hiển thị Text (V76) giữ nguyên)
             else:
-                
-                # (SỬA) Lấy chuỗi "sạch" từ 'document_text'
                 content = document_text 
-                
-                # (Bộ lọc cũ giữ nguyên)
                 if content.startswith(("[REMINDER_", "FACT:", "[FILE_UNSUPPORTED]", "[ERROR_PROCESSING_FILE]")):
                     continue
                 
                 summary = content
                 if len(summary) > 200 or "\n" in summary:
                      summary = (content.split('\n', 1)[0] or content).strip()[:200] + "..."
-                     
                 msg.content = f"**Ghi chú:** {summary}\n• ID: `{doc_id}`"
-                
                 actions = [
                     cl.Action(
                         name="delete_note", 
@@ -3105,7 +3079,6 @@ async def display_interactive_list(where_clause: dict, title: str):
                     ),
                     edit_action
                 ]
-            # --- 🚀 KẾT THÚC SỬA LỖI 76 (ĐỌC TEXT) 🚀 ---
             
             # 2d. Gửi tin nhắn
             msg.actions = actions
@@ -4354,7 +4327,49 @@ async def _display_rag_result(content_goc: str) -> bool:
     except Exception as e:
         print(f"❌ Lỗi hiển thị Ghi chú: {e}")
         return False
+# (DÁN HÀM MỚI NÀY VÀO KHOẢNG DÒNG 2990)
+def _helper_sort_results_by_timestamp(
+    ids: List[str], 
+    docs: List[str], 
+    metadatas: List[dict]
+) -> List[tuple[str, str, dict]]:
+    """
+    (MỚI - V94) Helper: Sắp xếp kết quả Chroma
+    theo 'timestamp' (mới nhất lên đầu).
+    """
+    temp_results_list = []
     
+    # 1. Gộp 3 list lại
+    for doc_id, content, metadata in zip(ids, docs, metadatas):
+        ts_str = "1970-01-01T00:00:00+00:00" # Mốc Unix (cho data cũ)
+        
+        # (Sửa lỗi V91 - Chống None)
+        if metadata and metadata.get("timestamp"):
+            ts_str = metadata.get("timestamp")
+        
+        temp_results_list.append({
+            "id": doc_id, 
+            "content": content, 
+            "metadata": metadata, 
+            "timestamp_str": ts_str
+        })
+    
+    # 2. Sắp xếp (mới nhất -> cũ nhất)
+    try:
+        sorted_temp_list = sorted(
+            temp_results_list, 
+            key=lambda x: x["timestamp_str"], 
+            reverse=True
+        )
+    except Exception as e_sort:
+        print(f"⚠️ Lỗi khi sắp xếp timestamp (V94 Helper): {e_sort}. Dùng danh sách gốc.")
+        sorted_temp_list = temp_results_list
+
+    # 3. Trả về dạng list of tuples
+    return [
+        (item["id"], item["content"], item["metadata"]) 
+        for item in sorted_temp_list
+    ]
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 3000)
 def _build_rag_filter_from_query(query: str) -> Optional[dict]:
     """(SỬA LỖI V89)
@@ -4907,52 +4922,62 @@ async def setup_chat_session(user: cl.User):
             return f"❌ Lỗi khi đọc từ điển fact: {e}"
 
     
-
+    # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 3611)
     @tool(args_schema=DatLichSchema)
     async def dat_lich_nhac_nho(noi_dung_nhac: str, thoi_gian: str, escalate: bool = False) -> str:
         """
         Lên lịch một thông báo nhắc nhở.
+        (SỬA LỖI V94 - THÊM TIMESTAMP)
         """
         vectorstore = cl.user_session.get("vectorstore")
         llm = cl.user_session.get("llm_logic") 
-        
-        # --- 🚀 BẮT ĐẦU SỬA LỖI (User-based) 🚀 ---
-        user_id_str = cl.user_session.get("user_id_str") # <-- Lấy User ID
+        user_id_str = cl.user_session.get("user_id_str") 
         
         if not vectorstore: return "❌ Lỗi: Không tìm thấy vectorstore."
         if not llm: return "❌ Lỗi: Không tìm thấy llm_logic." 
         if not user_id_str: return "❌ LỖI: Không tìm thấy 'user_id_str'. Vui lòng F5."
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
         
         try:
             ensure_scheduler()
             dt_when = None 
-            # (Xóa dòng internal_session_id, chúng ta dùng user_id_str)
             if not SCHEDULER: return "❌ LỖI NGHIÊM TRỌNG: Scheduler không thể khởi động."
             
             noti_text = (noi_dung_nhac or "").strip()
             if not noti_text: return "❌ Lỗi: Cần nội dung nhắc."
             
             facts_list = await _extract_fact_from_llm(llm, noti_text)
+            
+            # (SỬA LỖI V94) Lấy timestamp 1 lần
+            current_timestamp_iso = datetime.now(VN_TZ).isoformat()
+            
+            # (SỬA LỖI V94) Metadata chung
+            common_metadata = {
+                "file_type": "text", # Giả định là text
+                "timestamp": current_timestamp_iso
+            }
 
             repeat_sec = parse_repeat_to_seconds(thoi_gian)
             if repeat_sec > 0:
                 trigger = IntervalTrigger(seconds=repeat_sec, timezone=VN_TZ)
-                job_id = f"reminder-interval-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
-                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                job_id = f"reminder-interval-{user_id_str}-{uuid.uuid4().hex[:6]}"
+                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_INTERVAL] every={repeat_sec}s | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"🔁 ĐÃ LÊN LỊCH LẶP: '{noti_text}' • mỗi {repeat_sec} giây"
             
             cron = detect_cron_schedule(thoi_gian)
             if cron:
-                job_id = f"reminder-cron-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
-                SCHEDULER.add_job(_do_push, trigger=cron["trigger"], id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                job_id = f"reminder-cron-{user_id_str}-{uuid.uuid4().hex[:6]}"
+                SCHEDULER.add_job(_do_push, trigger=cron["trigger"], id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_CRON] type={cron['type']} | {thoi_gian} | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"📅 ĐÃ LÊN LỊCH ({cron['type']}): '{noti_text}' • {thoi_gian}"
             
@@ -4962,38 +4987,40 @@ async def setup_chat_session(user: cl.User):
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
             
             if escalate:
-                job_id = f"first-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
+                job_id = f"first-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
-                SCHEDULER.add_job(_first_fire_escalation_job, trigger=trigger, id=job_id, args=[user_id_str, noti_text, 5], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                SCHEDULER.add_job(_first_fire_escalation_job, trigger=trigger, id=job_id, args=[user_id_str, noti_text, 5], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_ESCALATE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"⏰ ĐÃ LÊN LỊCH (Leo thang): '{noti_text}' • lúc {_fmt_dt(dt_when)}"
             else:
-                job_id = f"reminder-{user_id_str}-{uuid.uuid4().hex[:6]}" # <-- SỬA
+                job_id = f"reminder-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
-                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60) # <-- SỬA
+                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
                 texts_to_save = [f"[REMINDER_ONCE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"] + facts_list
-                await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"⏰ ĐÃ LÊN LỊCH (1 lần): '{noti_text}' • lúc {_fmt_dt(dt_when)}"
         except Exception as e:
             return f"❌ Lỗi khi tạo nhắc: {e}"
+        
     # (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3185)
-    # (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3185)
+    # (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3213)
     @tool
     async def hoi_thong_tin(cau_hoi: str):
         """
-        (SỬA LỖI V93 - SẮP XẾP THEO TIMESTAMP)
-        1. (Sửa lỗi V93) Sau khi lấy kết quả (B5), 
-           sắp xếp (sort) lại chúng theo 'timestamp' 
-           (mới nhất lên đầu).
-        2. (Sửa lỗi V93) Nâng cấp Prompt B8 (V93) để GPT
-           ưu tiên kết quả đầu tiên (mới nhất).
-        
-        (LOGIC V90/V91 VẪN GIỮ NGUYÊN)
+        (SỬA LỖI V95 - FIX LỆNH 'XEM DANH MUC')
+        1. (MỚI) Thêm logic "Ưu tiên" (Short-circuit) để
+        bắt riêng lệnh 'xem danh muc'/'liet ke danh muc'
+        và chạy logic B3 (hiển thị fact_map).
+        2. (Cũ) Giữ nguyên logic RAG V94 cho tất cả các câu hỏi khác.
         """
         try:
             # --- Lấy các dependencies ---
@@ -5004,7 +5031,54 @@ async def setup_chat_session(user: cl.User):
             if not all([llm, vectorstore, user_id_str]):
                 return "❌ Lỗi: Thiếu (llm, vectorstore, user_id_str)."
 
-            print(f"[hoi_thong_tin] Đang RAG (Sửa lỗi V93) với query: '{cau_hoi}'")
+            print(f"[hoi_thong_tin] Đang RAG (Sửa lỗi V95) với query: '{cau_hoi}'")
+            
+            # --- 🚀 BẮT ĐẦU SỬA LỖI V95 (ƯU TIÊN LỆNH 'DANH MỤC') 🚀 ---
+            try:
+                # 1. Chuẩn hóa query (không dấu, chữ thường)
+                q_low_norm = unidecode.unidecode(cau_hoi.lower())
+                
+                # 2. Kiểm tra các từ khóa "danh mục"
+                # (Phải chứa 'danh muc' VÀ ('xem' hoặc 'tat ca' hoặc 'liet ke'))
+                if "danh muc" in q_low_norm and (
+                    "xem" in q_low_norm or "tat ca" in q_low_norm or "liet ke" in q_low_norm
+                ):
+                    print(f"[hoi_thong_tin] (Sửa lỗi V95) PHÁT HIỆN LỆNH ƯU TIÊN: '{cau_hoi}'. Đang chạy logic 'show_category_items'...")
+                    
+                    # 3. Lấy fact_dict
+                    fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
+                    
+                    # 4. (COPY LOGIC TỪ BƯỚC 3 CŨ)
+                    if not fact_dict: return "ℹ️ Bạn chưa lưu danh mục nào (Từ điển fact đang trống)."
+                    labels_to_keys = {}
+                    for d in fact_dict.values():
+                        if isinstance(d, dict) and d.get('label') and d.get('key') != 'danh_muc':
+                            labels_to_keys[d.get('label')] = d.get('key')
+                        elif isinstance(d, str) and d != 'danh_muc' and d != 'general':
+                            label = d.replace("_", " ").title()
+                            labels_to_keys[label] = d
+                    if not labels_to_keys: return "ℹ️ Bạn chưa lưu danh mục nào (Từ điển fact đang trống)."
+                    actions = []
+                    for label, key in sorted(labels_to_keys.items()):
+                        actions.append(
+                            cl.Action(
+                                name="show_category_items",
+                                label=f"📁 {label}",
+                                payload={"fact_key": key, "fact_label": label}
+                            )
+                        )
+                    await cl.Message(
+                        content="✅ **Các danh mục (Label) hiện tại của bạn:**\n(Bấm để xem chi tiết)",
+                        actions=actions
+                    ).send()
+                    
+                    # 5. Trả về và DỪNG HÀM
+                    return "✅ Đã hiển thị danh sách danh mục (Label) dưới dạng nút bấm."
+                    
+            except Exception as e_prio:
+                print(f"⚠️ Lỗi khi check ưu tiên 'danh muc' (V95): {e_prio}. Tiếp tục RAG...")
+            # --- 🚀 KẾT THÚC SỬA LỖI V95 🚀 ---
+
 
             # --- 🚀 BƯỚC 1: TÌM BỘ LỌC METADATA (file_type) 🚀 ---
             file_type_filter = _build_rag_filter_from_query(cau_hoi) 
@@ -5012,16 +5086,19 @@ async def setup_chat_session(user: cl.User):
             # --- 🚀 BƯỚC 2: GỌI GPT V88 (VỚI FACT_MAP) 🚀 ---
             fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
             
-            print(f"[hoi_thong_tin] B2 (Sửa lỗi V93) Đang gọi V88 (có fact_map) để lấy Key, Label, CoreQuery...")
+            print(f"[hoi_thong_tin] B2 (Sửa lỗi V95) Đang gọi V88 (có fact_map) để lấy Key, Label, CoreQuery...")
             
             target_fact_key, target_fact_label, core_search_query = await call_llm_to_classify(
                 llm, cau_hoi, fact_dict
             )
             
             # --- 🚀 BƯỚC 3: XỬ LÝ "DANH MUC" (Logic cũ - V61) 🚀 ---
+            # (Lưu ý: Logic V95 ở trên đã bắt hầu hết các trường hợp, 
+            #  nhưng ta giữ lại logic này phòng trường hợp
+            #  GPT V88 phân loại đúng 'target_fact_key' = 'danh_muc')
             if target_fact_key == "danh_muc":
                 # (Logic này giữ nguyên)
-                print(f"[hoi_thong_tin] Xử lý đặc biệt cho 'danh_muc'.")
+                print(f"[hoi_thong_tin] Xử lý đặc biệt cho 'danh_muc' (Fallback V61).")
                 if not fact_dict: return "ℹ️ Bạn chưa lưu danh mục nào (Từ điển fact đang trống)."
                 labels_to_keys = {}
                 for d in fact_dict.values():
@@ -5078,6 +5155,8 @@ async def setup_chat_session(user: cl.User):
                 # --- BƯỚC 5a (GENERAL) ---
                 print(f"[hoi_thong_tin] B5a (GENERAL): Đang gọi display_interactive_list (vì CoreQuery là 'ALL').")
                 if not target_fact_label: target_fact_label = target_fact_key.replace("_", " ").title()
+                
+                # (Hàm display_interactive_list đã được sửa V94)
                 found = await display_interactive_list(
                     where_clause=final_where_for_chroma, 
                     title=f"Danh sách các mục trong: {target_fact_label} (Key: {target_fact_key})"
@@ -5097,10 +5176,9 @@ async def setup_chat_session(user: cl.User):
                     n_results=20, 
                     where=final_where_for_chroma, 
                     where_document=final_where_doc_for_chroma, 
-                    include=["documents", "metadatas"] # <-- (V93) ĐÃ BAO GỒM METADATAS
+                    include=["documents", "metadatas"] 
                 )
                 
-                final_results_to_display = [] 
                 docs_goc_content = results.get("documents", [[]])[0] 
                 docs_goc_metadatas = results.get("metadatas", [[]])[0] 
                 ids_goc = results.get("ids", [[]])[0] 
@@ -5108,42 +5186,15 @@ async def setup_chat_session(user: cl.User):
                 if not docs_goc_content:
                     return f"ℹ️ Đã tìm (CoreQuery: '{search_vector_query}', Filter (Sửa lỗi V90): Where={final_where_for_chroma}) nhưng không tìm thấy."
                 
-                # --- 🚀 BẮT ĐẦU SỬA LỖI V93 (SORT BY TIMESTAMP) 🚀 ---
+                # --- 🚀 SỬA LỖI V94 (DÙNG HELPER SẮP XẾP) 🚀 ---
+                # (Thay thế toàn bộ logic sort cũ bằng helper V94)
                 
-                temp_results_list = []
-                for doc_id, content, metadata in zip(ids_goc, docs_goc_content, docs_goc_metadatas):
-                    # Lấy timestamp, nếu không có (dữ liệu cũ) thì dùng mốc 0
-                    ts_str = "1970-01-01T00:00:00+00:00" # Mốc Unix
-                    if metadata and metadata.get("timestamp"):
-                        ts_str = metadata.get("timestamp")
-                    
-                    temp_results_list.append({
-                        "id": doc_id, 
-                        "content": content, 
-                        "metadata": metadata, 
-                        "timestamp_str": ts_str
-                    })
+                final_results_to_display = _helper_sort_results_by_timestamp(
+                    ids_goc, docs_goc_content, docs_goc_metadatas
+                )
+                print(f"[hoi_thong_tin] (Sửa lỗi V94) Đã sắp xếp {len(final_results_to_display)} kết quả bằng helper (mới nhất lên đầu).")
                 
-                # Sắp xếp: MỚI NHẤT (timestamp LỚN NHẤT) lên đầu
-                try:
-                    sorted_temp_list = sorted(
-                        temp_results_list, 
-                        key=lambda x: x["timestamp_str"], 
-                        reverse=True
-                    )
-                except Exception as e_sort:
-                    print(f"⚠️ Lỗi khi sắp xếp timestamp (V93): {e_sort}. Dùng danh sách gốc.")
-                    sorted_temp_list = temp_results_list
-
-                # Ghi đè lại final_results_to_display
-                final_results_to_display = [
-                    (item["id"], item["content"], item["metadata"]) 
-                    for item in sorted_temp_list
-                ]
-                print(f"[hoi_thong_tin] (Sửa lỗi V93) Đã sắp xếp {len(final_results_to_display)} kết quả theo timestamp (mới nhất lên đầu).")
-                
-                # --- 🚀 KẾT THÚC SỬA LỖI V93 (SORT) 🚀 ---
-                
+                # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
 
                 # --- B6. PHÂN LOẠI HIỂN THỊ (SỬA LỖI V91) ---
                 has_text_in_final_results = False
@@ -5208,7 +5259,7 @@ async def setup_chat_session(user: cl.User):
                     return f"✅ Đã lọc (bằng LLM Smart Filter) và hiển thị {found_count} mục khớp."
                 
                 else: 
-                    # (ĐIỀU KIỆN 2: Q&A - ĐÂY LÀ NƠI SỬA LỖI V93)
+                    # (ĐIỀU KIỆN 2: Q&A - SỬA LỖI V93)
                     print(f"[hoi_thong_tin] B7 (Sửa lỗi V93): Gửi {len(final_results_to_display)} context (ĐÃ SẮP XẾP) cho RAG Q&A (Prompt V93)...")
                     
                     final_context_list = [content for _, content, _ in final_results_to_display if content]
@@ -5228,9 +5279,9 @@ async def setup_chat_session(user: cl.User):
 
                     QUY TẮC PHÂN TÍCH (RẤT QUAN TRỌNG):
                     1. Context đã được SẮP XẾP THEO THỜI GIAN. 
-                       Thông tin MỚI NHẤT nằm ở TRÊN CÙNG (Đầu tiên).
+                    Thông tin MỚI NHẤT nằm ở TRÊN CÙNG (Đầu tiên).
                     2. Nếu Context chứa thông tin MÂU THUẪN (ví dụ: "tôi thích ăn phở" VÀ "tôi thích ăn bún bò"), 
-                       hãy ƯU TIÊN TUYỆT ĐỐI thông tin đầu tiên (mới nhất).
+                    hãy ƯU TIÊN TUYỆT ĐỐI thông tin đầu tiên (mới nhất).
                     3. Chỉ trả lời dựa trên thông tin MỚI NHẤT (Đầu tiên) nếu có mâu thuẫn.
                     4. Nếu context không có thông tin, hãy nói "Tôi không tìm thấy thông tin này trong context."
 
@@ -5260,8 +5311,7 @@ async def setup_chat_session(user: cl.User):
                     
         except Exception as e:
             import traceback; traceback.print_exc()
-            return f"❌ Lỗi RAG (Sửa lỗi V93): {e}"
-    
+            return f"❌ Lỗi RAG (Sửa lỗi V95): {e}"
     @tool
     async def xem_lich_nhac() -> str:
         """
