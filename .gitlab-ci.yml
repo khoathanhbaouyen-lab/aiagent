@@ -2,6 +2,7 @@ stages:
   - deploy
 deploy_to_server:
   stage: deploy
+  image: alpine:3.19
   before_script:
     - apk add --no-cache openssh
     # debug xem GitLab có tạo file đúng chưa
