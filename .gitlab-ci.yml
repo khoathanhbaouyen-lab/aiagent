@@ -4,6 +4,7 @@ deploy_to_server:
   stage: deploy
   image: alpine:3.19
   before_script:
+    - cat -A "$SSH_PRIVATE_KEY" | head -5
     - apk add --no-cache openssh
     # debug xem GitLab có tạo file đúng chưa
     - echo ">>> File exists?" && ls -l "$SSH_PRIVATE_KEY" || true
