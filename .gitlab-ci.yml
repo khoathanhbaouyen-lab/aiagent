@@ -1,0 +1,19 @@
+stages:
+  - deploy
+deploy_to_server:
+  stage: deploy
+  image: alpine:3.19
+  before_script:
+    - cat -A "$SSH_PRIVATE_KEY" | head -5
+    - apk add --no-cache openssh
+    # debug xem GitLab có tạo file đúng chưa
+    - echo ">>> File exists?" && ls -l "$SSH_PRIVATE_KEY" || true
+    - echo ">>> First lines of key:" && head -5 "$SSH_PRIVATE_KEY" || true
+    - chmod 600 "$SSH_PRIVATE_KEY"
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -H 124.158.10.31 >> ~/.ssh/known_hosts
+  script:
+    - echo "🚀 Deploying to AIGPT server..."
+    - ssh -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no sammy@124.158.10.31 "cd /home/sammy/aigpt && ./deploy.sh"
+  only:
+    - local-main
