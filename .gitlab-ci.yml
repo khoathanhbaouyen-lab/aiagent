@@ -3,8 +3,12 @@ stages:
 
 deploy_to_server:
   stage: deploy
+  before_script:
+    # Tạo file key từ biến CI
+    - echo "$SSH_PRIVATE_KEY" > /tmp/aigpt_deploy_key
+    - chmod 600 /tmp/aigpt_deploy_key
   script:
     - echo "🚀 Deploying to AIGPT server..."
-    - ssh -i ~/.ssh/aigpt_deploy_key -o StrictHostKeyChecking=no sammy@124.158.10.31 "cd /home/sammy/aigpt && ./deploy.sh"
+    - ssh -i /tmp/aigpt_deploy_key -o StrictHostKeyChecking=no sammy@124.158.10.31 "cd /home/sammy/aigpt && ./deploy.sh"
   only:
     - local-main
