@@ -1,14 +1,17 @@
 stages:
   - deploy
-
 deploy_to_server:
   stage: deploy
   before_script:
-    # Tạo file key từ biến CI
-    - echo "$SSH_PRIVATE_KEY" > /tmp/aigpt_deploy_key
-    - chmod 600 /tmp/aigpt_deploy_key
+    - apk add --no-cache openssh
+    # debug xem GitLab có tạo file đúng chưa
+    - echo ">>> File exists?" && ls -l "$SSH_PRIVATE_KEY" || true
+    - echo ">>> First lines of key:" && head -5 "$SSH_PRIVATE_KEY" || true
+    - chmod 600 "$SSH_PRIVATE_KEY"
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -H 124.158.10.31 >> ~/.ssh/known_hosts
   script:
     - echo "🚀 Deploying to AIGPT server..."
-    - ssh -i /tmp/aigpt_deploy_key -o StrictHostKeyChecking=no sammy@124.158.10.31 "cd /home/sammy/aigpt && ./deploy.sh"
+    - ssh -i "$SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no sammy@124.158.10.31 "cd /home/sammy/aigpt && ./deploy.sh"
   only:
     - local-main
