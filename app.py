@@ -4670,8 +4670,8 @@ async def luu_thong_tin(noi_dung: str):
         # (Nếu text quá dài, cắt bớt 1000 ký tự đầu để gửi cho V88)
         # (Điều này chỉ để lấy Key/Label, không ảnh hưởng đến nội dung lưu)
         text_for_v88 = original_text
-        if len(text_for_v88) > 1000:
-            text_for_v88 = original_text[:1000] + "..."
+        if len(text_for_v88) > 100:
+            text_for_v88 = original_text[:100] + "..."
             print(f"[luu_thong_tin] (Sửa lỗi V97) Text quá dài, chỉ dùng 1000 ký tự đầu để phân loại V88...")
 
         fact_key, fact_label, core_query_term = await call_llm_to_classify(
@@ -5774,7 +5774,7 @@ async def setup_chat_session(user: cl.User):
         # (Sửa lỗi V95)
         "hoi_thong_tin": {
             "rule": "(HỎI/LỌC - ƯU TIÊN 1) Dùng cho TẤT CẢ các câu HỎI, TÌM KIẾM CÓ LỌC."
-                    "(Ví dụ: 'xem ghi chú server', 'tìm file excel', 'cho tôi pass', 'tôi thích ăn gì?', 'ds file trong cong viec', 'xem danh muc')."
+                    "(Ví dụ: 'xem ghi chú server', 'tìm file excel', 'cho tôi pass', 'tôi thích ăn gì?', 'ds file trong cong viec', 'xem danh muc','cho hình','lấy ...','gửi...')."
                     "Tool này là tool HỎI/TÌM chính.",
             "tool": hoi_thong_tin
         },
@@ -6040,7 +6040,7 @@ QUAN TRỌNG: Chỉ gọi tool. KHÔNG trả lời trực tiếp.
     
     # --- 11. Kết thúc (Giữ nguyên) ---
     await cl.Message(
-        content="🧠 **Trợ lý (Hybrid V95) đã sẵn sàng**. Hãy nhập câu hỏi để bắt đầu!"
+        content="🧠 **Trợ lý (Hybrid V96) đã sẵn sàng**. Hãy nhập câu hỏi để bắt đầu!"
     ).send()
     
     all_elements = cl.user_session.get("elements", [])
