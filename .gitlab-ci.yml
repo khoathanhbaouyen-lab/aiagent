@@ -1,0 +1,10 @@
+stages:
+  - deploy
+
+deploy_to_server:
+  stage: deploy
+  script:
+    - echo "🚀 Deploying to AIGPT server..."
+    - ssh -i ~/.ssh/aigpt_deploy_key -o StrictHostKeyChecking=no sammy@124.158.10.31 "cd /home/sammy/aigpt && ./deploy.sh"
+  only:
+    - local-main
