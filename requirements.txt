@@ -17,6 +17,10 @@ openpyxl
 python-docx
 pypdf
 
+# Web API for Custom Elements
+flask
+flask-cors
+
 # Scheduler & Time
 apscheduler
 SQLAlchemy
@@ -27,6 +31,8 @@ pytz
 python-dotenv
 requests
 unidecode
+beautifulsoup4
+openai
 
 pydantic==2.8.2
 pydantic-core==2.20.1
