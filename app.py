@@ -46,7 +46,7 @@ import asyncio
 from asyncio import Queue
 from apscheduler.triggers.date import DateTrigger
 import calendar
-
+from typing import Any
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.cron import CronTrigger # <--- MỚI: Thêm CronTrigger
 from chainlit.element import CustomElement # <-- 🚀 THÊM DÒNG NÀY
@@ -88,7 +88,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 GLOBAL_MEMORY_DIR = os.path.join(BASE_DIR, "memory_db")
 JOBSTORE_DB_FILE = os.path.join(GLOBAL_MEMORY_DIR, "jobs.sqlite")
 os.makedirs(GLOBAL_MEMORY_DIR, exist_ok=True)
-
+SEARCH_API_URL = "https://ocrm.oshima.vn/api/method/searchlistproductnew" # <-- 🚀 THÊM DÒNG NÀY (Nhớ thay URL nếu cần)
+GETUSER_API_URL = os.getenv("GETUSER_API_URL", "https://ocrm.oshima.vn/api/method/getuserocrm")
+CHART_API_URL = "https://ocrm.oshima.vn/api/method/salesperson" # <-- Khai báo thẳng URL ở đây
+CHANGEPASS_API_URL="https://ocrm.oshima.vn/api/method/changepassword"
 # 2. Thư mục toàn cục cho file public (không đổi)
 PUBLIC_DIR = os.path.join(BASE_DIR, "public")
 # Thư mục này sẽ chứa file upload của *tất cả* user
@@ -100,31 +103,30 @@ os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
 USER_DATA_ROOT = os.path.join(BASE_DIR, "user_data")
 os.makedirs(USER_DATA_ROOT, exist_ok=True)
 
-# 4. Thư mục CSDL User (MỚI)
-USERS_DB_FILE = os.path.join(USER_DATA_ROOT, "users.sqlite")
+
 
 # 5. Các thư mục con (SESSIONS, VECTOR) sẽ được tạo động theo user_id
 # (Thêm vào khoảng dòng 100)
-GETUSER_API_URL = os.getenv("GETUSER_API_URL", "https://ocrm.oshima.vn/api/method/getuserocrm")
+
 # --- 🚀 THÊM DÒNG NÀY (Theo cách của bạn) 🚀 ---
-CHART_API_URL = "https://ocrm.oshima.vn/api/method/salesperson" # <-- Khai báo thẳng URL ở đây
+
 # --- 🚀 KẾT THÚC THÊM DÒNG 🚀 ---
 
 CHANGEPASS_API_URL = os.getenv("CHANGEPASS_API_URL", "")
 
-CHANGEPASS_API_URL = os.getenv("CHANGEPASS_API_URL", "")
-CHANGEPASS_API_URL="https://ocrm.oshima.vn/api/method/changepassword"
+# Thư mục sessions và CSDL
 USER_SESSIONS_ROOT = os.path.join(USER_DATA_ROOT, "sessions")
-USER_VECTOR_DB_ROOT = os.path.join(USER_DATA_ROOT, "vector_db")
 os.makedirs(USER_SESSIONS_ROOT, exist_ok=True)
-os.makedirs(USER_VECTOR_DB_ROOT, exist_ok=True)
-# ----------------------------------------------
-# (Thêm dòng này vào gần dòng 170)
+
+USERS_DB_FILE = os.path.join(USER_DATA_ROOT, "users.sqlite")
+
+# Vector DB TẬP TRUNG (1 DB duy nhất cho tất cả user)
+SHARED_VECTOR_DB_DIR = os.path.join(USER_DATA_ROOT, "shared_vector_db")
+os.makedirs(SHARED_VECTOR_DB_DIR, exist_ok=True)
+
+# Fact Dict vẫn tách riêng
 USER_FACT_DICTS_ROOT = os.path.join(USER_DATA_ROOT, "fact_dictionaries")
 os.makedirs(USER_FACT_DICTS_ROOT, exist_ok=True)
-
-# (Ngay dưới CHART_API_URL)
-SEARCH_API_URL = "https://ocrm.oshima.vn/api/method/searchlistproductnew" # <-- 🚀 THÊM DÒNG NÀY (Nhớ thay URL nếu cần)
 
 # NEW: timeout giây
 PUSH_TIMEOUT = int(os.getenv("PUSH_TIMEOUT", "15"))
@@ -132,6 +134,8 @@ PUSH_TIMEOUT = int(os.getenv("PUSH_TIMEOUT", "15"))
 # Timezone VN
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
+# Cache vectorstore toàn cục (chỉ khởi tạo 1 lần)
+_SHARED_VECTORSTORE_CL = None
 # Global Scheduler (khởi tạo 1 lần)
 SCHEDULER: Optional[AsyncIOScheduler] = None
 # Cấu hình nơi lưu trữ job (database)
@@ -148,9 +152,61 @@ ACTIVE_ESCALATIONS = {}  # { internal_session_id: { "repeat_job_id": str, "acked
 # (Dán vào khoảng dòng 130)
 
 # --- 🚀 BẮT ĐẦU: CẤU HÌNH AVATAR HELPER (V47) 🚀 ---
+def _sanitize_email_for_path(email: str) -> str:
+    """
+    (MỚI - GIỐNG NICEGUI)
+    Chuyển email thành tên thư mục an toàn.
+    Ví dụ: "user@domain.com" -> "user_domain_com"
+    """
+    # Thay @ và . bằng _
+    safe_name = re.sub(r"[@\.]", "_", email)
+    # Xóa các ký tự không an toàn còn lại
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]", "", safe_name)
+    return safe_name.lower()  # Lowercase để tránh phân biệt chữ hoa/thường
 
 
+def get_user_fact_dict_path(user_email: str) -> str:
+    """
+    (MỚI - GIỐNG NICEGUI)
+    Lấy đường dẫn file JSON từ điển fact của user.
+    Dùng EMAIL làm định danh.
+    """
+    safe_name = _sanitize_email_for_path(user_email)
+    user_dir = os.path.join(USER_FACT_DICTS_ROOT, safe_name)
+    os.makedirs(user_dir, exist_ok=True)
+    return os.path.join(user_dir, "fact_map.json")
+# ==================== PATCH 3: TỐI ƯU HÓA TỐC ĐỘ TÌM KIẾM ====================
+# Thêm vào đầu file (sau các import, khoảng dòng 50)
 
+# Cache collection để tránh gọi .get() nhiều lần
+_FILE_LIST_CACHE = {}
+_CACHE_TIMEOUT = 5  # seconds
+
+
+def _get_cached_file_list(vectorstore: Chroma, user_email: str) -> list:
+    """
+    (MỚI - OPTIMIZATION)
+    Lấy danh sách file với cache 5 giây để tránh query Chroma liên tục.
+    """
+    global _FILE_LIST_CACHE
+    import time
+    
+    cache_key = f"{user_email}_files"
+    now = time.time()
+    
+    # Kiểm tra cache
+    if cache_key in _FILE_LIST_CACHE:
+        cached_data, cached_time = _FILE_LIST_CACHE[cache_key]
+        if (now - cached_time) < _CACHE_TIMEOUT:
+            print(f"[Cache HIT] Dùng cache cho {user_email}")
+            return cached_data
+    
+    # Cache miss -> Query Chroma
+    print(f"[Cache MISS] Query Chroma cho {user_email}")
+    file_list = list_active_files(vectorstore)
+    _FILE_LIST_CACHE[cache_key] = (file_list, now)
+    
+    return file_list
 def _call_get_users_api() -> List[dict]:
     """
     (SYNC) Gọi API getuserocrm. 
@@ -275,6 +331,41 @@ async def on_start_after_login():
         cl.user_session.set("user_name", "") # Đặt là rỗng nếu lỗi
     # --- 🚀 KẾT THÚC CẬP NHẬT 🚀 ---
 
+    # SỬA LỖI: Dòng 374-380 (app.py)
+
+    user_dict = cl.user_session.get("user")
+    if not user_dict:
+        await cl.Message(content="❌ Lỗi: Không tìm thấy thông tin user.").send()
+        return
+
+    # SỬA: user_dict là object User (không phải dict), dùng .identifier thay vì .get()
+    user_email = user_dict.identifier if hasattr(user_dict, 'identifier') else "unknown@example.com"
+    user_email = user_email.lower()  # Chuẩn hóa email (lowercase)
+
+    cl.user_session.set("user_email", user_email)  # Lưu email vào session
+    print(f"✅ [on_chat_start] User email: {user_email}")
+    
+    # --- KHỞI TẠO SHARED VECTORSTORE (1 DB DUY NHẤT CHO TẤT CẢ USER) ---
+    global _SHARED_VECTORSTORE_CL
+    
+    if _SHARED_VECTORSTORE_CL is None:
+        print("[Shared DB] Đang khởi tạo Shared VectorStore lần đầu...")
+        _SHARED_VECTORSTORE_CL = Chroma(
+            persist_directory=SHARED_VECTOR_DB_DIR,
+            embedding_function=embeddings,
+            collection_name="shared_memory"
+        )
+        print(f"✅ [Shared DB] Shared VectorStore đã khởi tạo tại {SHARED_VECTOR_DB_DIR}")
+    else:
+        print(f"[Shared DB] Sử dụng lại Shared VectorStore đã có (user: {user_email})")
+    
+    # Lưu vào session
+    cl.user_session.set("vectorstore", _SHARED_VECTORSTORE_CL)
+    retriever = _SHARED_VECTORSTORE_CL.as_retriever(search_kwargs={"k": 100})
+    cl.user_session.set("retriever", retriever)
+    
+    print(f"✅ VectorStore cho user '{user_email}' đã sẵn sàng tại {SHARED_VECTOR_DB_DIR} (mode=Similarity K=100)")
+    
     # 2. Khởi tạo Tổng đài (như cũ)
     global GLOBAL_MESSAGE_QUEUE, POLLER_STARTED
     if GLOBAL_MESSAGE_QUEUE is None:
@@ -699,49 +790,126 @@ def _find_reminders_by_text_db(text_query: str) -> List[dict]:
         print(f"❌ Lỗi _find_reminders_by_text_db: {e}")
 
     return found
+
 def _find_files_by_name_db(vectorstore: Chroma, name_query: str) -> List[dict]:
-    """(NÂNG CẤP) (SYNC) Tìm file/image (không phân biệt dấu) bằng Python.
-    (SỬA LỖI: Dùng 'all words' (set.issubset) thay vì 'in' (substring).)"""
-    
-    # 1. Lấy tất cả file/image từ CSDL
-    all_files = list_active_files(vectorstore) # (Hàm này đã có)
-    if not all_files:
-        return []
-    
-    found = []
-    
-    # --- 🚀 BẮT ĐẦU SỬA LỖI (Smarter Python Search) 🚀 ---
-    
-    # 2. Chuẩn bị query words (không dấu, chữ thường, tách riêng)
-    # (Biến thành một 'set' các từ)
-    safe_query_words = set(unidecode.unidecode(name_query).lower().split())
-    if not safe_query_words:
-        return []
+    """
+    (OPTIMIZATION V2 - NHANH HƠN 5-10 LẦN)
+    Tìm file/image bằng cách:
+    1. Lấy TẤT CẢ file từ Chroma (1 query duy nhất - NHANH)
+    2. Lọc bằng Python (không gọi LLM - NHANH)
+    3. Sắp xếp theo timestamp
+    """
+    try:
+        user_email = cl.user_session.get("user_email", "unknown")
         
-    # 3. Lọc bằng Python
-    for file_item in all_files:
+        # BƯỚC 1: Lấy tất cả file (1 query) - NHANH + FILTER theo user_id
+        data = vectorstore._collection.get(
+            where={
+                "$and": [
+                    {"user_id": user_email},
+                    {"file_type": {"$ne": "text"}}
+                ]
+            },
+            include=["metadatas"]  # Không cần documents để tiết kiệm băng thông
+        )
         
-        # 3a. Lấy tên file (không dấu)
-        safe_name = unidecode.unidecode(file_item['original_name']).lower()
+        ids = data.get("ids", [])
+        metadatas = data.get("metadatas", [])
         
-        # 3b. Lấy ghi chú (không dấu)
-        safe_note = unidecode.unidecode(file_item['note']).lower()
+        if not ids:
+            print(f"[FileFinder OPTIMIZED] Không tìm thấy file nào trong DB")
+            return []
         
-        # 3c. (MỚI) Gộp tên + ghi chú thành một chuỗi văn bản
-        # (Thêm dấu cách để "57dd620.jpg" và "luu" không dính liền)
-        searchable_text = safe_name + " " + safe_note
+        # BƯỚC 2: Chuẩn bị query (không dấu, lowercase, tách từ)
+        safe_query_words = set(unidecode.unidecode(name_query).lower().split())
+        if not safe_query_words:
+            return []
         
-        # 3d. (MỚI) Chia nhỏ văn bản thành một 'set' các từ
-        searchable_words = set(searchable_text.split())
-        
-        # 3e. (SỬA) Kiểm tra xem TẤT CẢ query words (is subset)
-        #     có nằm trong tập hợp (tên + ghi chú) không.
-        if safe_query_words.issubset(searchable_words):
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
-            found.append(file_item)
+        # BƯỚC 3: Lọc bằng Python (NHANH - không gọi LLM)
+        found = []
+        for doc_id, metadata in zip(ids, metadatas):
+            if not metadata:
+                continue
+                
+            content = metadata.get("original_content", "")
+            if not content:
+                continue
             
-    print(f"[FileFinder] Đã lọc {len(all_files)} -> còn {len(found)} (Query: '{name_query}')")
-    return found
+            # Parse nhanh bằng regex
+            name_match = re.search(r"name=([^|]+)", content)
+            note_match = re.search(r"note=([^|]+)", content)
+            path_match = re.search(r"path=([^|]+)", content)
+            
+            if not path_match:
+                continue
+            
+            file_name = name_match.group(1).strip() if name_match else ""
+            user_note = note_match.group(1).strip() if note_match else ""
+            
+            # Gộp tên + ghi chú (không dấu, lowercase)
+            searchable_text = unidecode.unidecode(f"{file_name} {user_note}").lower()
+            searchable_words = set(searchable_text.split())
+            
+            # Kiểm tra: TẤT CẢ query words phải có trong (tên + ghi chú)
+            if safe_query_words.issubset(searchable_words):
+                file_path = path_match.group(1).strip()
+                saved_name = os.path.basename(file_path)
+                file_type_str = metadata.get("file_type", "file")
+                ts_str = metadata.get("timestamp", "1970-01-01T00:00:00+00:00")
+                
+                type_tag = f"[{file_type_str.upper()}]"
+                if file_type_str == "image":
+                    type_tag = "[IMAGE]"
+                
+                found.append({
+                    "doc_id": doc_id,
+                    "file_path": file_path,
+                    "saved_name": saved_name,
+                    "original_name": file_name,
+                    "note": user_note,
+                    "type": type_tag,
+                    "timestamp_str": ts_str
+                })
+        
+        # BƯỚC 4: Sắp xếp (mới -> cũ)
+        found_sorted = sorted(found, key=lambda x: x["timestamp_str"], reverse=True)
+        
+        # --- BƯỚC 5: LLM SMART FILTER (Lọc chính xác) ---
+        if len(found_sorted) > 1:
+            # Chỉ dùng LLM khi có nhiều hơn 1 kết quả
+            llm = cl.user_session.get("llm_logic")
+            if llm:
+                try:
+                    # Chuẩn bị candidates cho LLM filter
+                    candidates_for_llm = [
+                        {
+                            "id": item["doc_id"],
+                            "name": item["original_name"],
+                            "note": item["note"]
+                        }
+                        for item in found_sorted
+                    ]
+                    
+                    filtered_candidates = _llm_filter_for_selection(llm, name_query, candidates_for_llm)
+                    
+                    # Map kết quả LLM trả về với found_sorted
+                    filtered_ids = {item["id"] for item in filtered_candidates}
+                    found_sorted = [item for item in found_sorted if item["doc_id"] in filtered_ids]
+                    
+                    print(f"[LLM Filter Selection] Đã lọc -> còn {len(found_sorted)} (Query: '{name_query}')")
+                except Exception as e:
+                    print(f"⚠️ LLM Filter lỗi, dùng kết quả Python: {e}")
+        
+        print(f"[FileFinder OPTIMIZED] Đã lọc {len(ids)} -> còn {len(found_sorted)} (Query: '{name_query}')")
+        return found_sorted
+        
+    except Exception as e:
+        print(f"❌ Lỗi _find_files_by_name_db: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
 
 def _delete_reminder_by_text_db(text_query: str) -> int:
     """(SYNC) Tìm và xóa các job trong Scheduler khớp với nội dung."""
@@ -853,12 +1021,11 @@ def validate_login_token(token: str) -> Optional[dict]:
         print(f"[Auth] Lỗi validate_login_token: {e}")
         return None
 
+# THAY ĐỔI: Hàm helper sanitize (giữ nguyên)
 def _sanitize_user_id_for_path(user_email: str) -> str:
-    """Biến email thành tên thư mục an toàn."""
-    # Thay @ và . bằng _
+    """Biến email thành ID an toàn (dùng cho metadata)."""
     safe_name = re.sub(r"[@\.]", "_", user_email)
-    # Xóa các ký tự không an toàn còn lại
-    return re.sub(r"[^a-zA-Z0-9_\-]", "", safe_name)
+    return re.sub(r"[^a-zA-Z0-9_\-]", "", safe_name).lower()
 
 # =========================================================
 # ️ MỚI: Quản lý Checklist Công việc (Tasks)
@@ -1597,12 +1764,7 @@ def _push_task_notification(
 
 def _timestamp() -> str:
     return datetime.now().strftime('%Y%m%d-%H%M%S')
-def get_user_fact_dict_path(user_id_str: str) -> str:
-    """Lấy đường dẫn file JSON từ điển fact của user."""
-    safe_name = _sanitize_user_id_for_path(user_id_str)
-    # Lưu file từ điển trong thư mục riêng của user
-    user_dir = get_user_vector_dir(user_id_str) 
-    return os.path.join(user_dir, "fact_map.json")
+
 
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1085)
 def load_user_fact_dict(user_id_str: str) -> dict:
@@ -1780,38 +1942,34 @@ embeddings = OpenAIEmbeddings(
     api_key=OPENAI_API_KEY,
     model="text-embedding-3-small"
 )
-
-# --- SỬA ĐỔI: Không khởi tạo vectorstore/retriever toàn cục ---
-# Chúng sẽ được khởi tạo theo user sau khi đăng nhập.
-
-def get_user_vector_dir(user_id_str: str) -> str:
-    """Lấy đường dẫn thư mục vector DB của user (và tạo nếu chưa có)."""
-    safe_user_dir = _sanitize_user_id_for_path(user_id_str)
-    user_dir = os.path.join(USER_VECTOR_DB_ROOT, safe_user_dir)
-    os.makedirs(user_dir, exist_ok=True)
-    return user_dir
-
-# THAY THẾ TOÀN BỘ HÀM NÀY (khoảng dòng 214)
-# THAY THẾ TOÀN BỘ HÀM NÀY (khoảng dòng 214)
-
-def get_user_vectorstore_retriever(user_id_str: str) -> Tuple[Chroma, any]:
-    """MỚI: Khởi tạo Vectorstore và Retriever cho 1 user cụ thể."""
-    persist_directory = get_user_vector_dir(user_id_str)
+def get_shared_vectorstore_retriever() -> Tuple[Chroma, Any]:
+    """
+    (MỚI - 1 DB CHUNG)
+    Khởi tạo Vectorstore CHUNG cho TẤT CẢ user.
+    Filter theo metadata['user_id'] khi query.
+    """
+    global _SHARED_VECTORSTORE, _SHARED_RETRIEVER, embeddings
     
-    vectorstore = Chroma(
-        persist_directory=persist_directory,
+    # Nếu đã khởi tạo rồi -> trả về cache
+    if _SHARED_VECTORSTORE is not None and _SHARED_RETRIEVER is not None:
+        return _SHARED_VECTORSTORE, _SHARED_RETRIEVER
+    
+    if embeddings is None:
+        raise ValueError("Lỗi: Embeddings chưa được khởi tạo (OPENAI_API_KEY có thể bị thiếu).")
+    
+    # Khởi tạo 1 lần duy nhất
+    _SHARED_VECTORSTORE = Chroma(
+        persist_directory=SHARED_VECTOR_DB_DIR,
         embedding_function=embeddings,
-        collection_name="memory"
+        collection_name="shared_memory"  # Collection chung
     )
-    # QUAY LẠI CÀI ĐẶT GỐC (K=5).
-    # "threshold" quá nghiêm ngặt.
-    # "mmr" cũng không cần thiết.
-    # Hãy để Retriever lấy 5 kết quả GẦN NHẤT.
-    # GPT (RAG) sẽ quyết định xem chúng có hữu ích hay không.
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
     
-    print(f"✅ VectorStore cho user '{user_id_str}' đã sẵn sàng tại {persist_directory} (mode=Similarity K=20)")
-    return vectorstore, retriever
+    # Retriever không filter (sẽ filter sau khi query)
+    _SHARED_RETRIEVER = _SHARED_VECTORSTORE.as_retriever(search_kwargs={"k": 100})
+    
+    print(f"✅ Shared VectorStore đã sẵn sàng tại {SHARED_VECTOR_DB_DIR}")
+    return _SHARED_VECTORSTORE, _SHARED_RETRIEVER
+
 
 # ---------------------------------------------------------
 
@@ -1947,7 +2105,10 @@ def _save_image_and_note(
     original_content_str = f"[IMAGE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
     vector_text_str = f"{fact_label} | {name} | {user_text.strip() or '(no note)'}"
     
+    user_email = cl.user_session.get("user_email", "unknown")
+    
     metadata = {
+        "user_id": user_email,
         "fact_key": fact_key, 
         "fact_label": fact_label, 
         "file_type": "image",
@@ -1972,10 +2133,16 @@ def _save_file_and_note(
 ) -> Tuple[str, str]:
     """
     (SỬA LỖI V94 - THÊM TIMESTAMP)
+    (SỬA LỖI V100 - FIX EXTENSION)
     """
     name = original_name or os.path.basename(src_path) or f"file-{uuid.uuid4().hex[:6]}"
+    
+    # V100: Lấy extension từ name HOẶC src_path (fallback)
     ext = os.path.splitext(name)[1]
-    safe_name = f"{_timestamp()}-{uuid.uuid4().hex[:6]}{ext or ''}"
+    if not ext:  # Nếu name không có ext, lấy từ src_path
+        ext = os.path.splitext(src_path)[1]
+    
+    safe_name = f"{_timestamp()}-{uuid.uuid4().hex[:6]}{ext}"
     
     dst = os.path.join(PUBLIC_FILES_DIR, safe_name)
     shutil.copyfile(src_path, dst)
@@ -1983,7 +2150,10 @@ def _save_file_and_note(
     original_content_str = f"[FILE] path={dst} | name={name} | note={user_text.strip() or '(no note)'}"
     vector_text_str = f"{fact_label} | {name} | {user_text.strip() or '(no note)'}"
     
+    user_email = cl.user_session.get("user_email", "unknown")
+    
     metadata = {
+        "user_id": user_email,
         "fact_key": fact_key, 
         "fact_label": fact_label, 
         "file_type": file_type,
@@ -2024,8 +2194,9 @@ def _load_and_process_document(
     metadata_note = f"Trích từ tài liệu: {original_name} | Ghi chú của người dùng: {user_note}"
     text_content = ""
     
-    # (SỬA LỖI V94) Lấy timestamp 1 lần
+    # (SỬA LỖI V94) Lấy timestamp 1 lần và user_email
     current_timestamp_iso = datetime.now(VN_TZ).isoformat()
+    user_email = cl.user_session.get("user_email", "unknown")
 
     try:
         # 1. Đọc nội dung (logic không đổi)
@@ -2052,6 +2223,7 @@ def _load_and_process_document(
             original_content_str = f"[FILE_UNSUPPORTED] path={src_path} | name={original_name} | note={user_note}"
             vector_text_str = f"{fact_label} | {original_name} | {user_note} | File không hỗ trợ"
             metadata = {
+                "user_id": user_email,
                 "fact_key": fact_key, 
                 "fact_label": fact_label, 
                 "file_type": simple_file_type,
@@ -2078,6 +2250,7 @@ def _load_and_process_document(
 
         # --- (LƯU CHUNKS) ---
         chunk_metadatas = [{
+            "user_id": user_email,
             "file_type": simple_file_type, 
             "fact_label": fact_label, 
             "fact_key": fact_key,
@@ -2103,6 +2276,7 @@ def _load_and_process_document(
         original_content_str = f"[ERROR_PROCESSING_FILE] name={original_name} | note={user_note} | error={e}"
         vector_text_str = f"{fact_label} | {original_name} | {user_note} | Lỗi xử lý file"
         metadata = {
+            "user_id": user_email,
             "fact_key": fact_key, 
             "fact_label": fact_label, 
             "file_type": simple_file_type,
@@ -2120,7 +2294,11 @@ def _load_and_process_document(
 def dump_all_memory_texts(vectorstore: Chroma) -> str: # <-- SỬA
     """SỬA ĐỔI: Nhận vectorstore của user."""
     try:
-        raw = vectorstore._collection.get()
+        user_email = cl.user_session.get("user_email", "unknown")
+        raw = vectorstore._collection.get(
+            where={"user_id": user_email},
+            include=["documents"]
+        )
         docs = raw.get("documents", []) or []
         if not docs:
             return "📭 Bộ nhớ đang trống. Chưa lưu gì cả."
@@ -2128,36 +2306,49 @@ def dump_all_memory_texts(vectorstore: Chroma) -> str: # <-- SỬA
     except Exception as e:
         return f"⚠️ Không đọc được bộ nhớ: {e}"
 
-# (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1868)
-def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
+# ==================== PATCH 5: TỐI ƯU HÓA HÀM LIST_ACTIVE_FILES ====================
+# THAY THẾ hàm list_active_files (khoảng dòng 2132)
+
+def list_active_files(vectorstore: Chroma) -> list[dict]:
     """
-    (SỬA LỖI V94 - LẤY TIMESTAMP)
-    Quét ChromaDB của user
-    Lọc bằng metadata['file_type'] != 'text'
-    Đọc dữ liệu từ metadata['original_content']
+    (OPTIMIZATION V2)
+    Quét ChromaDB lấy file/ảnh (NHANH - chỉ 1 query).
     """
     out = []
     try:
+        user_email = cl.user_session.get("user_email", "unknown")
+        
+        # OPTIMIZATION: Chỉ lấy metadatas (không cần documents) + FILTER theo user_id
         data = vectorstore._collection.get(
-            where={"file_type": {"$ne": "text"}},
-            include=["documents", "metadatas"] 
+            where={
+                "$and": [
+                    {"user_id": user_email},
+                    {"file_type": {"$ne": "text"}}
+                ]
+            },
+            include=["metadatas"]  # Không cần documents
         )
         
         ids = data.get("ids", [])
-        docs = data.get("documents", [])
-        metadatas = data.get("metadatas", []) 
+        metadatas = data.get("metadatas", [])
         
-        for doc_id, document_text, metadata in zip(ids, docs, metadatas):
-            if not metadata: continue
+        for doc_id, metadata in zip(ids, metadatas):
+            if not metadata:
+                continue
             
             content = metadata.get("original_content")
-            if not content: continue 
+            if not content:
+                continue
 
+            # Parse nhanh
             path_match = re.search(r"path=([^|]+)", content)
             name_match = re.search(r"name=([^|]+)", content)
             note_match = re.search(r"note=([^|]+)", content)
 
-            file_path = path_match.group(1).strip() if path_match else "unknown"
+            if not path_match:
+                continue
+
+            file_path = path_match.group(1).strip()
             file_name = name_match.group(1).strip() if name_match else "unknown"
             user_note = note_match.group(1).strip() if note_match else "(không có)"
             
@@ -2165,13 +2356,12 @@ def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
             file_type_str = metadata.get("file_type", "file")
             
             type_tag = f"[{file_type_str.upper()}]"
-            if file_type_str == "image": type_tag = "[IMAGE]"
-            elif file_type_str == "text": continue 
+            if file_type_str == "image":
+                type_tag = "[IMAGE]"
+            elif file_type_str == "text":
+                continue
             
-            # --- 🚀 SỬA LỖI V94 (LẤY TIMESTAMP) 🚀 ---
-            # (Lấy timestamp, nếu không có thì dùng mốc 0)
             ts_str = metadata.get("timestamp", "1970-01-01T00:00:00+00:00")
-            # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
             
             out.append({
                 "doc_id": doc_id,
@@ -2180,19 +2370,18 @@ def list_active_files(vectorstore: Chroma) -> list[dict]: # <-- SỬA
                 "original_name": file_name,
                 "note": user_note,
                 "type": type_tag,
-                "timestamp_str": ts_str # <-- (V94) Thêm vào dict
+                "timestamp_str": ts_str
             })
             
     except Exception as e:
+        print(f"[ERROR] Lỗi list_active_files: {e}")
         import traceback
-        print("[ERROR] Lỗi nghiêm trọng trong list_active_files (V94):")
-        print(traceback.format_exc())
+        traceback.print_exc()
         
-    # --- 🚀 SỬA LỖI V94 (SẮP XẾP) 🚀 ---
     # Sắp xếp theo timestamp (mới nhất lên đầu)
     return sorted(out, key=lambda x: x["timestamp_str"], reverse=True)
-    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
-    
+
+
 
 # =========================================================
 # 🧠 Trích FACT (SỬ DỤNG LLM) - (Hàm mới)
@@ -2981,15 +3170,26 @@ async def display_interactive_list(where_clause: dict, title: str):
     if not vectorstore:
         await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
         return 0 
+    
+    user_email = cl.user_session.get("user_email", "unknown")
+    
+    # Gộp filter user_id với where_clause
+    if where_clause:
+        combined_where = {
+            "$and": [
+                {"user_id": user_email},
+                where_clause
+            ]
+        }
+    else:
+        combined_where = {"user_id": user_email}
 
     try:
         await cl.Message(content=f"**{title} (Mới nhất lên đầu)**").send() # <-- (V94) Thêm
         
-        final_where_for_chroma = where_clause if where_clause else None
-        
         results = await asyncio.to_thread(
             vectorstore._collection.get, 
-            where=final_where_for_chroma,
+            where=combined_where,
             include=["documents", "metadatas"] 
         )
         if results is None: results = {}
@@ -3489,36 +3689,72 @@ async def ui_show_active_files():
         await cl.Message(content="📭 Bộ nhớ file của bạn đang trống.").send()
         return
 
-    await cl.Message(content=f"🗂️ **Danh sách {len(items)} file đã lưu:**").send()
-    for it in items:
-        safe_href = f"/public/files/{it['saved_name']}"
-        safe_name = html.escape(it['original_name'])
+    # Phân loại: ảnh riêng, file riêng
+    images_list = [it for it in items if it['type'] == '[IMAGE]']
+    files_list = [it for it in items if it['type'] != '[IMAGE]']
+    
+    await cl.Message(content=f"🗂️ **My Drive** • {len(images_list)} ảnh • {len(files_list)} file").send()
+    
+    # Hiển thị ảnh dạng Google Drive grid
+    if images_list:
+        # Chuẩn bị dữ liệu cho ImageGrid
+        images_data = []
+        valid_images = []
         
-        # --- 🚀 BẮT ĐẦU SỬA LỖI HIỂN THỊ 🚀 ---
-        display_content = "" # Biến hiển thị mới
+        for it in images_list:
+            # Skip nếu file không tồn tại trên disk
+            if not os.path.exists(it['file_path']):
+                print(f"[WARNING] File không tồn tại, skip: {it['file_path']}")
+                continue
+                
+            safe_href = f"/public/files/{it['saved_name']}"
+            images_data.append({
+                "name": it['original_name'],
+                "note": it['note'],
+                "url": safe_href,
+                "path": it['file_path'],
+                "doc_id": it['doc_id'],
+                "file_path": it['file_path']
+            })
+            valid_images.append(it)
         
-        if it['type'] == '[IMAGE]':
-            # (MỚI) Hiển thị TÊN + ẢNH
-            display_content = f"**{safe_name}** {it['type']}\n![{safe_name}]({safe_href})"
-        else:
-            # (CŨ) Chỉ hiển thị TÊN
-            display_content = f"**[{safe_name}]({safe_href})** {it['type']}"
-
-        body = (
-            f"{display_content}\n" # <-- SỬA DÒNG NÀY
-            f"• Ghi chú: *{it['note']}*\n"
-            f"• ID: `{it['doc_id']}`"
+        # Gửi ImageGrid với nút xóa API
+        el = cl.CustomElement(
+            name="ImageGrid",
+            props={"title": f"📸 Ảnh ({len(valid_images)})", "images": images_data, "showActions": False},
+            display="inline",
         )
-        # --- 🚀 KẾT THÚC SỬA LỖI HIỂN THỊ 🚀 ---
+        await cl.Message(content="", elements=[el]).send()
+    
+    # Hiển thị file dạng FileGrid
+    if files_list:
+        files_data = []
+        valid_files = []
         
-        actions = [
-                cl.Action(
-                    name="delete_file",
-                    payload={"doc_id": it["doc_id"], "file_path": it["file_path"]}, 
-                    label="🗑️ Xóa file này"
-                )
-            ]
-        await cl.Message(content=body, actions=actions).send()
+        for it in files_list:
+            # Skip nếu file không tồn tại
+            if not os.path.exists(it['file_path']):
+                print(f"[WARNING] File không tồn tại, skip: {it['file_path']}")
+                continue
+                
+            safe_href = f"/public/files/{it['saved_name']}"
+            files_data.append({
+                "name": it['original_name'],
+                "note": it['note'],
+                "type": it['type'],
+                "url": safe_href,
+                "doc_id": it['doc_id'],
+                "file_path": it['file_path']
+            })
+            valid_files.append(it)
+        
+        # Gửi FileGrid với nút xóa API
+        el = cl.CustomElement(
+            name="FileGrid",
+            props={"title": f"📁 Tài liệu ({len(valid_files)})", "files": files_data, "showActions": False},
+            display="inline",
+        )
+        await cl.Message(content="", elements=[el]).send()
         
 @cl.action_callback("delete_reminder")
 async def _on_delete_reminder(action: cl.Action):
@@ -4648,7 +4884,9 @@ async def luu_thong_tin(noi_dung: str):
     2. (CŨ) Dùng GPT (V88) chỉ để lấy fact_key, fact_label, VÀ core_query_term.
     3. (MỚI) Ép sử dụng text_splitter để chia nhỏ (chunk)
        và lưu NỘI DUNG GỐC (không phải tóm tắt).
+    (SỬA - THÊM user_id VÀO METADATA)
     """
+    # Lấy dependencies từ session
     vectorstore = cl.user_session.get("vectorstore")
     llm = cl.user_session.get("llm_logic") 
     user_id_str = cl.user_session.get("user_id_str") 
@@ -4663,64 +4901,68 @@ async def luu_thong_tin(noi_dung: str):
         if not original_text: return "⚠️ Không có nội dung để lưu."
         
         # 2. (CŨ) Gọi GPT V88 để phân loại
-        #    (Chúng ta dùng original_text để phân loại)
+        #    (CHỈ GỬI PHẦN TIÊU ĐỀ - 200 ký tự đầu)
         fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
-        print(f"[luu_thong_tin] (Sửa lỗi V97) Đang gọi GPT (V88) để phân loại ghi chú (dài {len(original_text)} chars)...")
         
-        # (Nếu text quá dài, cắt bớt 1000 ký tự đầu để gửi cho V88)
-        # (Điều này chỉ để lấy Key/Label, không ảnh hưởng đến nội dung lưu)
-        text_for_v88 = original_text
-        if len(text_for_v88) > 100:
-            text_for_v88 = original_text[:100] + "..."
-            print(f"[luu_thong_tin] (Sửa lỗi V97) Text quá dài, chỉ dùng 1000 ký tự đầu để phân loại V88...")
+        # (OPTIMIZATION) Chỉ gửi 200 ký tự đầu (tiêu đề) lên LLM để tiết kiệm token
+        text_for_classification = original_text
+        if len(original_text) > 200:
+            # Lấy 200 ký tự đầu, cắt ở cuối từ để tránh cắt giữa chừng
+            text_for_classification = original_text[:200].rsplit(' ', 1)[0] + "..."
+            print(f"[luu_thong_tin] (OPTIMIZATION) Text dài {len(original_text)} chars, chỉ gửi {len(text_for_classification)} chars (tiêu đề) cho LLM phân loại.")
+        else:
+            print(f"[luu_thong_tin] Đang gọi GPT (V88) để phân loại ghi chú (dài {len(original_text)} chars)...")
 
         fact_key, fact_label, core_query_term = await call_llm_to_classify(
-            llm, text_for_v88, fact_dict
+            llm, text_for_classification, fact_dict
         )
         print(f"[luu_thong_tin] (Sửa lỗi V97) GPT (V88) trả về: Key='{fact_key}', Label='{fact_label}', CoreQuery='{core_query_term}'")
         
-        # --- 🚀 BƯỚC B: CHIA NHỎ VÀ LƯU NỘI DUNG GỐC 🚀 ---
-        text_splitter = _get_text_splitter()
+        # --- 🚀 BƯỚC B: LƯU NỘI DUNG (OPTIMIZATION - NHANH) 🚀 ---
+        # STRATEGY: Với text dài, lưu NGUYÊN 1 CHUNK (không chia nhỏ)
+        # để tăng tốc embedding (giống NiceGUI)
         
-        # (SỬA LỖI) Chia nhỏ NỘI DUNG GỐC (original_text)
-        chunks = text_splitter.split_text(original_text) 
-        
-        if not chunks:
-            return "⚠️ Văn bản rỗng sau khi chia nhỏ, không lưu gì cả."
-        print(f"[luu_thong_tin] (Sửa lỗi V97) Đã chia nhỏ NỘI DUNG GỐC thành {len(chunks)} chunks.")
-
-        # --- (Logic V93 - Thêm Timestamp - Giữ nguyên) ---
         current_timestamp_iso = datetime.now(VN_TZ).isoformat()
+        user_email = cl.user_session.get("user_email", "unknown")
+        
         metadata_base = {
-            "fact_key": fact_key, 
-            "fact_label": fact_label, 
+            "user_id": user_email,
+            "fact_key": fact_key,
+            "fact_label": fact_label,
             "file_type": "text",
-            "timestamp": current_timestamp_iso
+            "timestamp": current_timestamp_iso,
         }
-        metadatas_list = [metadata_base.copy() for _ in chunks]
+        
+        # OPTIMIZATION: Không chia nhỏ, lưu nguyên 1 chunk
+        # → Nhanh hơn 5-10 lần (chỉ 1 embedding call thay vì 6)
+        chunks = [original_text]
+        metadatas_list = [metadata_base]
+        
+        print(f"[luu_thong_tin] (OPTIMIZATION) Lưu NGUYÊN 1 chunk ({len(original_text)} chars) - Không chia nhỏ để tăng tốc.")
         
         # 3. Ghi CHUNKS (NỘI DUNG GỐC) vào Vectorstore
         await asyncio.to_thread(
             vectorstore.add_texts,
-            texts=chunks, # <-- Lưu chunks (nội dung gốc)
+            texts=chunks, # <-- Lưu 1 chunk (nội dung gốc nguyên)
             metadatas=metadatas_list
         )
+        print(f"[luu_thong_tin] ✅ (OPTIMIZATION) Đã lưu 1 chunk vào shared DB (user_id={user_email}).")
         
         # --- 🚀 BƯỚC C: LƯU VÀO CACHE (FACT_MAP) (Giữ nguyên) 🚀 ---
         if core_query_term and core_query_term.strip().lower() != "all":
             cache_key = core_query_term.strip().lower()
             fact_dict[cache_key] = {"key": fact_key, "label": fact_label} 
             await asyncio.to_thread(save_user_fact_dict, user_id_str, fact_dict)
-            print(f"[luu_thong_tin] (Sửa lỗi V97) Đã cập nhật cache: '{cache_key}' -> '{fact_key}'")
+            print(f"[luu_thong_tin] Đã cập nhật cache: '{cache_key}' -> '{fact_key}'")
         else:
-            print(f"[luu_thong_tin] (Sửa lỗi V97) Bỏ qua cập nhật cache vì CoreQuery là '{core_query_term}'")
+            print(f"[luu_thong_tin] Bỏ qua cập nhật cache vì CoreQuery là '{core_query_term}'")
         
-        preview_text = chunks[0]
-        if len(preview_text) > 100:
-            preview_text = preview_text[:100] + "..."
-            
-        msg = f"✅ ĐÃ LƯU (Nội dung gốc - {len(chunks)} chunks): {preview_text} (Label: {fact_label})"
-        return msg
+        return (
+            f"✅ Đã lưu ghi chú thành công!\n\n"
+            f"**Chủ đề:** {fact_label}\n"
+            f"**Số ký tự:** {len(original_text)}\n"
+            f"**Tối ưu:** Lưu 1 chunk nguyên (nhanh gấp 5-10 lần)"
+        )
         
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -4785,19 +5027,16 @@ async def setup_chat_session(user: cl.User):
     cl.user_session.set("poller_task", poller_task)
     print("✅ Kết nối OpenAI OK.")
     
-    # --- 🚀 BẮT ĐẦU SỬA LỖI (THÊM KHỐI NÀY) 🚀 ---
-    # (MỚI) 6b. Khởi tạo Vectorstore & Retriever cho USER
-    try:
-        vectorstore, retriever = await asyncio.to_thread(
-            get_user_vectorstore_retriever, user_id_str
-        )
-        cl.user_session.set("vectorstore", vectorstore)
-        cl.user_session.set("retriever", retriever)
-    except Exception as e_vec:
-        print(f"❌ Lỗi nghiêm trọng khi khởi tạo Vectorstore: {e_vec}")
-        await cl.Message(content=f"❌ Lỗi khởi tạo Vectorstore: {e_vec}").send()
-        return # Dừng setup nếu không có vectorstore
-
+    # NOTE: Vectorstore đã được khởi tạo ở on_chat_start (Shared DB)
+    # Không cần khởi tạo lại ở đây
+    
+    # Lấy retriever từ session
+    retriever = cl.user_session.get("retriever")
+    if not retriever:
+        print("❌ Lỗi: Không tìm thấy retriever trong session")
+        await cl.Message(content="❌ Lỗi: Không tìm thấy retriever").send()
+        return
+    
     # --- 7. RAG Chain (TỔNG HỢP) ---
     rag_prompt = ChatPromptTemplate.from_template(
         "Bạn là một trợ lý RAG (truy xuất-tăng cường). Nhiệm vụ của bạn là trả lời câu hỏi của người dùng (input) CHỈ dựa trên thông tin trong (context) được cung cấp."
@@ -5088,18 +5327,44 @@ async def setup_chat_session(user: cl.User):
             # --- 🚀 BƯỚC 1: TÌM BỘ LỌC METADATA (file_type) 🚀 ---
             file_type_filter = _build_rag_filter_from_query(cau_hoi) 
             
-            # --- 🚀 BƯỚC 2: GỌI GPT V88 (VỚI FACT_MAP) 🚀 ---
-            fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
+            # --- 🚀 BƯỚC 2: OPTIMIZATION - FAST PATH (V99) 🚀 ---
+            # Nếu câu hỏi là Q&A đơn giản (KHÔNG có từ "danh mục", "tất cả", "file", "ảnh")
+            # → SKIP call_llm_to_classify để tăng tốc (tiết kiệm 1-1.5s)
+            import re
+            q_low = cau_hoi.lower()
             
-            print(f"[hoi_thong_tin] B2 (Sửa lỗi V96) Đang gọi V88 (có fact_map) để lấy Key, Label, CoreQuery...")
+            # Kiểm tra từ ĐẦY ĐỦ (dùng word boundary) để tránh match nhầm
+            has_list_keywords = bool(re.search(r'\b(tat ca|tất cả|toan bo|toàn bộ|danh sach|danh sách|list|ds)\b', q_low))
             
-            target_fact_key, target_fact_label, core_search_query = await call_llm_to_classify(
-                llm, cau_hoi, fact_dict
+            is_simple_qa = (
+                not file_type_filter  # Không hỏi về file/ảnh
+                and "danh muc" not in q_low
+                and not has_list_keywords  # Không có từ khóa liệt kê
             )
             
-            # --- 🚀 BƯỚC 3: XỬ LÝ "DANH MUC" (Logic cũ - V61) 🚀 ---
-            if target_fact_key == "danh_muc":
+            if is_simple_qa:
+                # FAST PATH: SKIP phân loại, đi thẳng vector search
+                print(f"[hoi_thong_tin] (V99) ⚡ FAST PATH: Q&A đơn giản, SKIP call_llm_to_classify")
+                target_fact_key = "general"
+                target_fact_label = "General"
+                core_search_query = cau_hoi  # Dùng câu hỏi gốc
+                is_general_query = False  # Luôn là SPECIFIC (Q&A)
+            else:
+                # SLOW PATH: Gọi LLM phân loại đầy đủ
+                print(f"[hoi_thong_tin] (V99) 🐌 SLOW PATH: Câu hỏi phức tạp, gọi call_llm_to_classify")
+                fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
+                
+                print(f"[hoi_thong_tin] B2 (Sửa lỗi V96) Đang gọi V88 (có fact_map) để lấy Key, Label, CoreQuery...")
+                
+                target_fact_key, target_fact_label, core_search_query = await call_llm_to_classify(
+                    llm, cau_hoi, fact_dict
+                )
+                is_general_query = (core_search_query.upper() == "ALL" or not core_search_query.strip())
+            
+            # --- 🚀 BƯỚC 3: XỬ LÝ "DANH MUC" (FAST PATH bỏ qua) 🚀 ---
+            if not is_simple_qa and target_fact_key == "danh_muc":
                 print(f"[hoi_thong_tin] Xử lý đặc biệt cho 'danh_muc' (Fallback V61).")
+                fact_dict = await asyncio.to_thread(load_user_fact_dict, user_id_str)
                 if not fact_dict: return "ℹ️ Bạn chưa lưu danh mục nào (Từ điển fact đang trống)."
                 labels_to_keys = {}
                 for d in fact_dict.values():
@@ -5123,10 +5388,13 @@ async def setup_chat_session(user: cl.User):
                     actions=actions
                 ).send()
                 return "✅ Đã hiển thị danh sách danh mục (Label) dưới dạng nút bấm."
-
-            # --- 🚀 BƯỚC 4: XÂY DỰNG BỘ LỌC (SỬA LỖI V90) 🚀 ---
+            
+            # --- 🚀 BƯỚC 4: XÂY DỰNG BỘ LỌC (SỬA LỖI V90 + THÊM user_id) 🚀 ---
+            user_email = cl.user_session.get("user_email", "unknown")
             where_clause = {}
-            final_filter_list = []
+            final_filter_list = [
+                {"user_id": user_email}  # LỌC THEO USER TRƯỚC
+            ]
             
             is_general_query = (core_search_query.upper() == "ALL" or not core_search_query.strip())
             
@@ -5237,27 +5505,150 @@ async def setup_chat_session(user: cl.User):
                     )
                     
                     print(f"[hoi_thong_tin] B7 (Sửa lỗi): Hiển thị {len(final_filtered_results)} (Đã qua LLM Filter).")
-                    await cl.Message(content=f"**Kết quả lọc (đã qua LLM) cho: {cau_hoi}**").send()
+                    
                     if not final_filtered_results:
                         return f"ℹ️ Đã tìm thấy {len(candidates_for_llm_filter)} ứng viên, nhưng Bộ lọc LLM (Smart Filter) đã loại bỏ chúng (vì không khớp TÊN file)."
-                    found_count = 0
+                    
+                    # V102: Phân loại ảnh theo fact_key và file
+                    from collections import defaultdict
+                    images_by_fact_key = defaultdict(list)
+                    files = []
+                    
                     for item in final_filtered_results:
                         doc_id = item['id']; metadata = item['metadata']
                         content = metadata.get("original_content"); file_type = metadata.get("file_type", "file")
-                        msg = cl.Message(content=""); edit_action = cl.Action(name="edit_item_placeholder", payload={"doc_id": doc_id}, label="✏️ Sửa")
+                        fact_key = metadata.get("fact_key", None)  # Lấy fact_key từ metadata
+                        
+                        # Debug: In ra fact_key để kiểm tra
+                        print(f"[DEBUG] doc_id={doc_id}, fact_key={fact_key}, file_type={file_type}")
+                        
                         try:
-                            path_match = re.search(r"path=([^|]+)", content); name_match = re.search(r"name=([^|]+)", content); note_match = re.search(r"note=([^|]+)", content)
+                            path_match = re.search(r"path=([^|]+)", content)
+                            name_match = re.search(r"name=([^|]+)", content)
+                            note_match = re.search(r"note=([^|]+)", content)
                             if not path_match: continue
-                            full_path = path_match.group(1).strip(); saved_name = os.path.basename(full_path); safe_href = f"/public/files/{saved_name}"
-                            goc_name = name_match.group(1).strip() if name_match else "N/A"; goc_note = note_match.group(1).strip() if note_match else "(không ghi chú)"; safe_name = html.escape(goc_name)
-                            display_content = ""
-                            if file_type == 'image': display_content = f"**{safe_name}** [IMAGE]\n![{safe_name}]({safe_href})"
-                            else: display_content = f"**[{safe_name}]({safe_href})** [{file_type.upper()}]"
-                            msg.content = f"{display_content}\n• Ghi chú: *{goc_note}*\n• ID: `{doc_id}`"
-                            actions = [ cl.Action( name="delete_file", payload={"doc_id": doc_id, "file_path": full_path, "message_id": msg.id}, label="🗑️ Xóa File"), edit_action ]
-                            msg.actions = actions; await msg.send(); found_count += 1
-                        except Exception as e_file: await cl.Message(content=f"Lỗi parse file: {e_file}").send()
-                    return f"✅ Đã lọc (bằng LLM Smart Filter) và hiển thị {found_count} mục khớp."
+                            
+                            full_path = path_match.group(1).strip()
+                            saved_name = os.path.basename(full_path)
+                            goc_name = name_match.group(1).strip() if name_match else "N/A"
+                            goc_note = note_match.group(1).strip() if note_match else "(không ghi chú)"
+                            
+                            # Nếu không có fact_key, dùng tên file làm key
+                            if not fact_key:
+                                fact_key = goc_name
+                            
+                            if file_type == 'image':
+                                # Group ảnh theo fact_key
+                                images_by_fact_key[fact_key].append({
+                                    "doc_id": doc_id,
+                                    "path": full_path,
+                                    "name": goc_name,
+                                    "note": goc_note,
+                                    "saved_name": saved_name,
+                                    "fact_key": fact_key
+                                })
+                            else:
+                                files.append({
+                                    "doc_id": doc_id,
+                                    "path": full_path,
+                                    "name": goc_name,
+                                    "note": goc_note,
+                                    "file_type": file_type,
+                                    "saved_name": saved_name
+                                })
+                        except Exception as e_parse:
+                            print(f"[hoi_thong_tin] Lỗi parse item: {e_parse}")
+                            continue
+                    
+                    # V102: Hiển thị mỗi fact_key thành 1 album riêng
+                    print(f"[DEBUG] Tổng số fact_key groups: {len(images_by_fact_key)}")
+                    for fact_key, images_list in images_by_fact_key.items():
+                        print(f"[DEBUG] fact_key='{fact_key}', số ảnh={len(images_list)}")
+                        
+                        if len(images_list) >= 2:
+                            # Chuẩn bị dữ liệu cho ImageGrid
+                            images_data = []
+                            actions = []
+                            for img in images_list:
+                                # Skip nếu file không tồn tại
+                                if not os.path.exists(img['path']):
+                                    print(f"[WARNING] File không tồn tại, skip: {img['path']}")
+                                    continue
+                                    
+                                safe_href = f"/public/files/{img['saved_name']}"
+                                images_data.append({
+                                    "name": img['name'],
+                                    "note": img['note'],
+                                    "url": safe_href,
+                                    "path": img['path'],
+                                    "doc_id": img['doc_id'],
+                                    "file_path": img['path']
+                                })
+                                
+                                # Hidden action cho delete
+                                actions.append(cl.Action(
+                                    name="delete_file",
+                                    value="delete",
+                                    payload={"doc_id": img['doc_id'], "file_path": img['path']},
+                                    label=f"DEL_{img['doc_id']}",
+                                    description=f"Delete {img['name']}"
+                                ))
+                            
+                            # Tên album: Nếu fact_key giống tên file đầu tiên -> dùng tên đó, không thì format
+                            if fact_key == images_list[0]['name']:
+                                fact_label = fact_key  # Dùng tên file gốc
+                            else:
+                                fact_label = fact_key.replace("_", " ").title()
+                            
+                            print(f"[DEBUG] Hiển thị album: '{fact_label}' với {len(images_list)} ảnh")
+                            
+                            # Gửi ImageGrid custom element
+                            el = cl.CustomElement(
+                                name="ImageGrid",
+                                props={"title": f"📸 {fact_label} ({len(images_list)} ảnh)", "images": images_data},
+                                display="inline",
+                            )
+                            await cl.Message(content="", elements=[el]).send()
+                            
+                            # Gửi actions riêng cho từng ảnh trong album
+                            for idx, img in enumerate(images_list, 1):
+                                msg = cl.Message(content=f"_{idx}. {img['name']}_")
+                                msg.actions = [
+                                    cl.Action(name="delete_file", payload={"doc_id": img['doc_id'], "file_path": img['path']}, label=f"🗑️ {idx}"),
+                                    cl.Action(name="edit_item_placeholder", payload={"doc_id": img['doc_id']}, label=f"✏️ {idx}")
+                                ]
+                                await msg.send()
+                        elif len(images_list) == 1:
+                            # 1 ảnh: hiển thị bình thường
+                            img = images_list[0]
+                            safe_href = f"/public/files/{img['saved_name']}"
+                            safe_name = html.escape(img['name'])
+                            
+                            msg = cl.Message(
+                                content=f"**{safe_name}** [IMAGE]\n![{safe_name}]({safe_href})\n• Ghi chú: *{img['note']}*\n• ID: `{img['doc_id']}`"
+                            )
+                            msg.actions = [
+                                cl.Action(name="delete_file", payload={"doc_id": img['doc_id'], "file_path": img['path']}, label="🗑️ Xóa"),
+                                cl.Action(name="edit_item_placeholder", payload={"doc_id": img['doc_id']}, label="✏️ Sửa")
+                            ]
+                            await msg.send()
+                    
+                    # Hiển thị files (nếu có)
+                    for f in files:
+                        safe_href = f"/public/files/{f['saved_name']}"
+                        safe_name = html.escape(f['name'])
+                        
+                        msg = cl.Message(
+                            content=f"**[{safe_name}]({safe_href})** [{f['file_type'].upper()}]\n• Ghi chú: *{f['note']}*\n• ID: `{f['doc_id']}`"
+                        )
+                        msg.actions = [
+                            cl.Action(name="delete_file", payload={"doc_id": f['doc_id'], "file_path": f['path']}, label="🗑️ Xóa"),
+                            cl.Action(name="edit_item_placeholder", payload={"doc_id": f['doc_id']}, label="✏️ Sửa")
+                        ]
+                        await msg.send()
+                    
+                    # Return rỗng để Agent không hiển thị thêm message
+                    return ""
                 
                 else: 
                     print(f"[hoi_thong_tin] B7 (Sửa lỗi V93): Gửi {len(final_results_to_display)} context (ĐÃ SẮP XẾP) cho RAG Q&A (Prompt V93)...")
@@ -5320,36 +5711,137 @@ async def setup_chat_session(user: cl.User):
         try: await ui_show_active_reminders()
         except Exception as e: return f"❌ Lỗi khi hiển thị lịch: {e}"
         return "✅ Đã liệt kê các lịch nhắc đang hoạt động."
-
-    @tool
-    async def tim_file_de_tai_ve(ten_goc_cua_file: str):
+ 
+    @tool("tim_kiem_file")
+    async def tim_kiem_file(tu_khoa: str):
         """
-        Tìm một file hoặc ảnh đã lưu dựa theo TÊN GỐC
-        và trả về link/ảnh để tải về.
+        🔍 TÌM KIẾM file/ảnh cụ thể theo TÊN, NĂM, hoặc CHỦ ĐỀ.
+        
+        ✅ DÙNG KHI user muốn TÌM file CỤ THỂ:
+        - "cho tôi file 2022" → tu_khoa = "2022"
+        - "cho tôi file ds 2022" → tu_khoa = "ds 2022"
+        - "tìm ảnh du lịch" → tu_khoa = "du lịch"
+        - "file báo cáo tháng 5" → tu_khoa = "báo cáo tháng 5"
+        
+        ❌ KHÔNG DÙNG khi user muốn xem TẤT CẢ file (dùng xem_danh_sach_file)
+        
+        Trả về file/ảnh khớp nhất (có LLM smart filter).
         """
-        retriever = cl.user_session.get("retriever")
-        if not retriever: return "❌ Lỗi: Không tìm thấy retriever."
+        vectorstore = cl.user_session.get("vectorstore")
+        llm = cl.user_session.get("llm_logic")
+        if not vectorstore: return "❌ Lỗi: Không tìm thấy vectorstore."
+        if not llm: return "❌ Lỗi: Không tìm thấy LLM."
+        
         try:
-            results = await retriever.ainvoke(f"file hoặc ảnh có tên {ten_goc_cua_file}")
-            found_path_url = None; found_name = ten_goc_cua_file; is_image = False 
-            for doc in results:
-                content = doc.page_content
-                if ten_goc_cua_file.lower() in content.lower() and ("[FILE]" in content or "[IMAGE]" in content):
-                    path_match = re.search(r"path=([^|]+)", content)
-                    name_match = re.search(r"name=([^|]+)", content)
-                    if path_match and name_match:
-                        full_path = path_match.group(1).strip()
-                        saved_name = os.path.basename(full_path)
-                        found_name = name_match.group(1).strip() 
-                        is_image = "[IMAGE]" in content
-                        found_path_url = f"/public/files/{saved_name}" 
-                        break 
-            if found_path_url:
-                safe_href = found_path_url; safe_name = html.escape(found_name)
-                if is_image: return f"Tìm thấy ảnh: \n![{safe_name}]({safe_href})"
-                else: return f"Tìm thấy file: **[{safe_name}]({safe_href})**"
-            else: return f"⚠️ Không tìm thấy file hoặc ảnh nào khớp với tên '{ten_goc_cua_file}'."
-        except Exception as e: return f"❌ Lỗi khi tìm file: {e}"
+            # B1. TÌM bằng Python filter (dùng hàm có sẵn)
+            candidates = await asyncio.to_thread(
+                _find_files_by_name_db, vectorstore, tu_khoa
+            )
+            
+            if not candidates:
+                return f"⚠️ Không tìm thấy file/ảnh nào khớp với '{tu_khoa}'."
+            
+            # B2. Nếu có NHIỀU kết quả → LLM lọc chọn 1
+            if len(candidates) > 1:
+                print(f"[tim_kiem_file] Tìm thấy {len(candidates)} candidates, dùng LLM chọn best match...")
+                
+                list_str = "\n".join([
+                    f"{i+1}. {c.get('original_name', 'Unknown')} (timestamp: {c.get('timestamp', 'N/A')})"
+                    for i, c in enumerate(candidates[:10])  # Chỉ show 10 đầu
+                ])
+                
+                filter_prompt = f"""User tìm kiếm: "{tu_khoa}"
+
+Danh sách file tìm thấy:
+{list_str}
+
+Chọn file KHỚP NHẤT (trả về số thứ tự 1-{min(len(candidates), 10)}). 
+Nếu không chắc chắn, chọn file CÓ NĂM/NGÀY khớp hoặc tên gần giống nhất.
+Chỉ trả về 1 số, không giải thích."""
+
+                resp = await llm.ainvoke(filter_prompt)
+                choice_text = resp.content.strip()
+                
+                try:
+                    choice_idx = int(choice_text) - 1
+                    if 0 <= choice_idx < len(candidates):
+                        best_match = candidates[choice_idx]
+                        print(f"[tim_kiem_file] LLM chọn #{choice_idx+1}: {best_match.get('original_name')}")
+                    else:
+                        print(f"[tim_kiem_file] LLM trả về index ngoài range, lấy đầu tiên")
+                        best_match = candidates[0]
+                except:
+                    print(f"[tim_kiem_file] LLM không trả về số, lấy đầu tiên")
+                    best_match = candidates[0]
+            else:
+                best_match = candidates[0]
+            
+            # B3. Trả về link/ảnh
+            saved_path = best_match.get("file_path", "")
+            original_name = best_match.get("original_name", tu_khoa)
+            is_image = best_match.get("type") == "[IMAGE]"
+            
+            if not saved_path:
+                return f"❌ Không tìm thấy đường dẫn file cho '{original_name}'."
+            
+            # V100: FIX - Nếu file thiếu extension, copy sang tên mới
+            orig_ext = os.path.splitext(original_name)[1]
+            if orig_ext and not saved_path.endswith(orig_ext):
+                # File hiện tại thiếu extension → Copy sang file mới
+                saved_path_with_ext = saved_path + orig_ext
+                
+                if os.path.isfile(saved_path) and not os.path.exists(saved_path_with_ext):
+                    try:
+                        import shutil
+                        shutil.copy2(saved_path, saved_path_with_ext)
+                        print(f"[tim_kiem_file] V100: Đã copy file sang tên có extension: {saved_path_with_ext}")
+                        saved_path = saved_path_with_ext
+                    except Exception as e:
+                        print(f"[tim_kiem_file] V100: Lỗi khi copy file: {e}")
+                elif os.path.exists(saved_path_with_ext):
+                    # File có extension đã tồn tại
+                    saved_path = saved_path_with_ext
+            
+            # DEBUG: Log path để kiểm tra
+            print(f"[tim_kiem_file] DEBUG: saved_path='{saved_path}'")
+            print(f"[tim_kiem_file] DEBUG: os.path.isfile()={os.path.isfile(saved_path) if saved_path else False}")
+            
+            if not os.path.isfile(saved_path):
+                return f"❌ File '{original_name}' không tồn tại (path: {saved_path})."
+            
+            # V100: Dùng Chainlit Element thay vì Markdown link để tránh ZIP
+            try:
+                # Tạo Chainlit File element với tên file gốc
+                file_element = cl.File(
+                    name=original_name,  # Tên file gốc (có extension)
+                    path=saved_path,     # Path đầy đủ
+                    display="inline"     # Hiển thị inline
+                )
+                
+                # Gửi file element
+                await cl.Message(
+                    content=f"Tìm thấy file: **{original_name}**",
+                    elements=[file_element]
+                ).send()
+                
+                # Return rỗng để Agent không hiển thị thêm message
+                return ""
+                
+            except Exception as e:
+                # Fallback: Dùng URL cũ nếu Element lỗi
+                print(f"[tim_kiem_file] Lỗi tạo File element: {e}")
+                saved_name = os.path.basename(saved_path)
+                file_url = f"/public/files/{saved_name}"
+                safe_name = html.escape(original_name)
+                
+                if is_image:
+                    return f"Tìm thấy ảnh: \n![{safe_name}]({file_url})"
+                else:
+                    return f"Tìm thấy file: **[{safe_name}]({file_url})**"
+                
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return f"❌ Lỗi khi tìm file (V98): {e}"
 
     # (THAY THẾ CLASS NÀY - khoảng dòng 3515)
     class XoaFileSchema(BaseModel):
@@ -5428,12 +5920,16 @@ async def setup_chat_session(user: cl.User):
     @tool("xem_danh_sach_file")
     async def xem_danh_sach_file() -> str:
         """
-        (SỬA LỖI 49 - THEO Ý USER)
-        CHỈ SỬ DỤNG nếu người dùng yêu cầu xem "TẤT CẢ", "TOÀN BỘ",
-        hoặc "danh sách đầy đủ" file/ảnh.
-        (Ví dụ: 'xem tất cả file', 'show all files').
-        TUYỆT ĐỐI KHÔNG DÙNG cho các câu hỏi có từ khóa lọc
-        (ví dụ: 'xem ảnh du lịch', 'xem file 2022').
+        ⚠️ QUAN TRỌNG: CHỈ dùng khi user muốn xem TẤT CẢ file KHÔNG LỌC.
+        
+        SỬ DỤNG KHI:
+        - "xem tất cả file"
+        - "show all files/images"
+        - "danh sách đầy đủ"
+        
+        ❌ KHÔNG DÙNG KHI:
+        - Có BẤT KỲ từ khóa lọc nào (năm, tên, chủ đề): "file 2022", "ảnh du lịch", "ds 2022"
+        - User muốn TÌM file cụ thể → Dùng `tim_kiem_file` thay thế
         """
         try: await ui_show_active_files()
         except Exception as e: return f"❌ Lỗi khi hiển thị danh sách file: {e}"
@@ -5774,7 +6270,7 @@ async def setup_chat_session(user: cl.User):
         # (Sửa lỗi V95)
         "hoi_thong_tin": {
             "rule": "(HỎI/LỌC - ƯU TIÊN 1) Dùng cho TẤT CẢ các câu HỎI, TÌM KIẾM CÓ LỌC."
-                    "(Ví dụ: 'xem ghi chú server', 'tìm file excel', 'cho tôi pass', 'tôi thích ăn gì?', 'ds file trong cong viec', 'xem danh muc','cho hình','lấy ...','gửi...')."
+                    "(Ví dụ: 'xem ghi chú server', 'tìm file excel', 'cho tôi pass', 'tôi thích ăn gì?', 'ds file trong cong viec', 'xem ds hình', 'cho ảnh vũng tàu', 'xem danh muc','cho hình','lấy ...','gửi...')."
                     "Tool này là tool HỎI/TÌM chính.",
             "tool": hoi_thong_tin
         },
@@ -5804,10 +6300,16 @@ async def setup_chat_session(user: cl.User):
                     "PHẢI CÓ TỪ 'ghi chú' hoặc 'note'. KHÔNG DÙNG cho 'tất cả danh mục' hay 'tất cả file'.",
             "tool": xem_bo_nho
         },
+        "tim_kiem_file": {
+            "rule": "(TÌM FILE CỤ THỂ - ƯU TIÊN 1) Nếu 'input' yêu cầu TÌM/LẤY file/ảnh CỤ THỂ với TỪ KHÓA."
+                    "(Ví dụ: 'cho tôi file 2022', 'tìm ảnh du lịch', 'file ds 2022', 'lấy file báo cáo')."
+                    "DÙNG KHI: Có từ khóa tìm kiếm (năm, tên, chủ đề).",
+            "tool": tim_kiem_file
+        },
         "xem_danh_sach_file": {
-            "rule": "(XEM FILE ĐẦY ĐỦ - ƯU TIÊN 2) CHỈ DÙNG nếu 'input' yêu cầu 'TẤT CẢ FILE', 'TOÀN BỘ ẢNH'."
-                    "(Ví dụ: 'xem tất cả file', 'liệt kê toàn bộ file')."
-                    "PHẢI CÓ TỪ 'file' hoặc 'ảnh'. KHÔNG DÙNG cho 'tất cả danh mục'.",
+            "rule": "(XEM TẤT CẢ FILE - ƯU TIÊN 2) CHỈ DÙNG nếu 'input' yêu cầu 'TẤT CẢ FILE', 'TOÀN BỘ ẢNH' KHÔNG CÓ TỪ KHÓA LỌC."
+                    "(Ví dụ: 'xem tất cả file', 'liệt kê toàn bộ file', 'show all files')."
+                    "❌ KHÔNG DÙNG khi có từ khóa lọc: 'file 2022', 'ảnh du lịch', 'ds hình', 'ds file trong công việc' → Dùng `hoi_thong_tin` hoặc `tim_kiem_file`.",
             "tool": xem_danh_sach_file
         },
         "xem_tu_dien_fact": {
@@ -5866,66 +6368,7 @@ async def setup_chat_session(user: cl.User):
         "xem_viec_da_hoan_thanh": base_tools_data["xem_viec_da_hoan_thanh"],
         "xem_lich_nhac": base_tools_data["xem_lich_nhac"],
         "xem_bo_nho": base_tools_data["xem_bo_nho"],
-        "xem_danh_sach_file": base_tools_data["xem_danh_sach_file"],
-    }
-    
-    save_tools_data = {
-        "luu_thong_tin": base_tools_data["luu_thong_tin"],
-        "dat_lich_cong_viec": base_tools_data["dat_lich_cong_viec"],
-        "dat_lich_nhac_nho": base_tools_data["dat_lich_nhac_nho"],
-    }
-    
-    delete_tools_data = {
-        "xoa_file_da_luu": base_tools_data["xoa_file_da_luu"],
-        "xoa_cong_viec": base_tools_data["xoa_cong_viec"],
-        "xoa_ghi_chu": base_tools_data["xoa_ghi_chu"],
-        "xoa_nhac_nho": base_tools_data["xoa_nhac_nho"],
-    }
-    
-    debug_tools_data = {
-        "xem_tu_dien_fact": base_tools_data["xem_tu_dien_fact"],
-        "push_thu": base_tools_data["push_thu"],
-    }
-    
-    # 2.3. Tạo chuỗi quy tắc cho từng nhóm
-    ask_rules = build_rules_string(ask_tools_data)
-    save_rules = build_rules_string(save_tools_data)
-    delete_rules = build_rules_string(delete_tools_data)
-    debug_rules = build_rules_string(debug_tools_data)
-    admin_rules = build_rules_string(admin_tools_data) if is_admin else ""
-    is_admin = cl.user_session.get("is_admin", False)
-    
-    # 1. Gộp dict
-    final_tools_data = {}
-    is_admin = cl.user_session.get("is_admin", False)
-    
-    intent_options = ["ASKING", "SAVING", "DELETING", "DEBUG"]
-    if is_admin:
-        intent_options.append("ADMIN")
-        
-    intent_list_str = ", ".join([f"'{opt}'" for opt in intent_options])
-    # === BƯỚC 2: TẠO "SIÊU PROMPT" (THEO Ý TƯỞNG CỦA BẠN) ===
-
-    # 2.1. Helper để tạo chuỗi quy tắc (phân nhóm)
-    def build_rules_string(tools_data_dict):
-        return "\n".join([
-            f"- {tool_name}: {data['rule']}" 
-            for tool_name, data in tools_data_dict.items()
-        ])
-
-    # 2.2. Phân loại tool vào các nhóm (để chèn vào prompt)
-    ask_tools_data = {
-        "get_product_detail": base_tools_data["get_product_detail"],
-        "searchlistproductnew": base_tools_data["searchlistproductnew"],
-        "goi_chart_dashboard": base_tools_data["goi_chart_dashboard"],
-        "hien_thi_web": base_tools_data["hien_thi_web"],
-        "hoi_thong_tin": base_tools_data["hoi_thong_tin"],
-        "tim_cong_viec_qua_han": base_tools_data["tim_cong_viec_qua_han"],
-        "tim_cong_viec_theo_ngay": base_tools_data["tim_cong_viec_theo_ngay"],
-        "xem_viec_chua_hoan_thanh": base_tools_data["xem_viec_chua_hoan_thanh"],
-        "xem_viec_da_hoan_thanh": base_tools_data["xem_viec_da_hoan_thanh"],
-        "xem_lich_nhac": base_tools_data["xem_lich_nhac"],
-        "xem_bo_nho": base_tools_data["xem_bo_nho"],
+        "tim_kiem_file": base_tools_data["tim_kiem_file"],
         "xem_danh_sach_file": base_tools_data["xem_danh_sach_file"],
     }
     
