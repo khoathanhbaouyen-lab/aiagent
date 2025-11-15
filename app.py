@@ -2444,18 +2444,50 @@ async def ui_show_all_memory():
         await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
         return
     
-    # Phải chạy sync
+    # Phải chạy sync - Lấy tất cả text, sau đó lọc chunk
     def _get_docs_sync():
         return vectorstore._collection.get(
-            where={"file_type": "text"}, # <-- (V94) Chỉ lấy text
+            where={"file_type": "text"},
             include=["documents", "metadatas"]
         )
     
     raw_data = await asyncio.to_thread(_get_docs_sync)
     
-    ids = raw_data.get("ids", [])
-    docs = raw_data.get("documents", [])
-    metadatas = raw_data.get("metadatas", []) # (V94) Lấy metadatas
+    all_ids = raw_data.get("ids", [])
+    all_docs = raw_data.get("documents", [])
+    all_metadatas = raw_data.get("metadatas", [])
+    
+    # DEBUG: Gửi message để thấy log
+    debug_msg = f"🔍 DEBUG: Tổng {len(all_docs)} docs text"
+    await cl.Message(content=debug_msg).send()
+    
+    # In terminal
+    print(f"\n{'='*60}")
+    print(f"[DEBUG] ui_show_all_memory V1: Tổng {len(all_docs)} docs")
+    for i in range(min(10, len(all_docs))):
+        meta = all_metadatas[i]
+        entry_type = meta.get('entry_type', 'N/A')
+        print(f"[DEBUG] Doc #{i}: entry_type='{entry_type}', preview={all_docs[i][:60]}...")
+    
+    # Lọc bỏ chunks (chỉ giữ master: entry_type không phải file_chunk)
+    ids, docs, metadatas = [], [], []
+    chunk_count = 0
+    for i, (doc_id, doc, meta) in enumerate(zip(all_ids, all_docs, all_metadatas)):
+        entry_type = meta.get("entry_type", "")
+        # Bỏ qua chunks (chỉ giữ text gốc và file_master)
+        if entry_type != "file_chunk":
+            ids.append(doc_id)
+            docs.append(doc)
+            metadatas.append(meta)
+        else:
+            chunk_count += 1
+            if chunk_count <= 3:  # Chỉ log 3 chunk đầu
+                print(f"[DEBUG] ❌ Filtered chunk #{chunk_count}: {doc[:60]}...")
+    
+    print(f"[DEBUG] ✅ Kept: {len(docs)} docs | ❌ Filtered: {chunk_count} chunks")
+    print(f"{'='*60}\n")
+    
+    await cl.Message(content=f"🔍 Sau lọc: {len(docs)} ghi chú | Bỏ {chunk_count} chunks").send()
     
     if not docs:
         await cl.Message(content="📭 Bộ nhớ đang trống. Chưa lưu gì cả.").send()
@@ -2469,9 +2501,9 @@ async def ui_show_all_memory():
     sorted_results = _helper_sort_results_by_timestamp(ids, docs, metadatas)
     
     for doc_id, content, metadata in sorted_results:
-    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 ---
+    # --- 🚀 KẾT THÚC SỬA LỖI V94 🚀 --- 
     
-        if not content: continue
+        if not content: continue 
         
         # (Bộ lọc này giữ nguyên, mặc dù 'where' đã lọc)
         if content.startswith(("[FILE]", "[IMAGE]", "[REMINDER_", 
@@ -2490,6 +2522,17 @@ async def ui_show_all_memory():
                 label="🗑️ Xóa"
             )
         ]
+        
+        # 🔍 Thêm nút debug xem chunks (chỉ cho parent_doc)
+        entry_type = metadata.get("entry_type", "")
+        if entry_type == "parent_doc":
+            actions.append(
+                cl.Action(
+                    name="show_chunks_debug",
+                    payload={"doc_id": doc_id},
+                    label="🔍 Xem chunks"
+                )
+            )
         
         if len(content) > 150 or "\n" in content:
             summary = "• " + (content.split('\n', 1)[0] or content).strip()[:150] + "..."
@@ -3155,6 +3198,81 @@ async def _on_show_note_detail(action: cl.Action):
         print(f"❌ Lỗi nghiêm trọng trong _on_show_note_detail (ID: {doc_id}):")
         traceback.print_exc() 
         await cl.Message(content=f"❌ Lỗi khi mở dschi tiết (Debug): {str(e)}").send()
+
+
+@cl.action_callback("show_chunks_debug")
+async def _on_show_chunks_debug(action: cl.Action):
+    """🔍 DEBUG: Hiển thị danh sách chunks của parent để test Sentence Window."""
+    vectorstore = cl.user_session.get("vectorstore")
+    if not vectorstore:
+        await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
+        return
+
+    doc_id = action.payload.get("doc_id")
+    if not doc_id:
+        await cl.Message(content="❌ Lỗi: Không nhận được doc_id.").send()
+        return
+
+    try:
+        # 1. Lấy parent document để xem parent_id
+        parent_data = await asyncio.to_thread(
+            vectorstore._collection.get,
+            ids=[doc_id],
+            include=["metadatas"]
+        )
+        
+        if not parent_data or not parent_data.get("metadatas"):
+            await cl.Message(content=f"❌ Không tìm thấy document ID: {doc_id}").send()
+            return
+            
+        parent_meta = parent_data["metadatas"][0]
+        parent_id = parent_meta.get("parent_id")
+        entry_type = parent_meta.get("entry_type", "N/A")
+        
+        # 2. Nếu là parent_doc, tìm các search_chunk con
+        if entry_type == "parent_doc" and parent_id:
+            # ChromaDB không hỗ trợ nhiều điều kiện where → lọc sau
+            chunks_data = await asyncio.to_thread(
+                vectorstore._collection.get,
+                where={"parent_id": parent_id},
+                include=["documents", "metadatas"]
+            )
+            
+            all_chunks = chunks_data.get("documents", [])
+            all_metas = chunks_data.get("metadatas", [])
+            
+            # Lọc chỉ lấy search_chunk (bỏ parent_doc)
+            chunks_content = []
+            chunks_meta = []
+            for doc, meta in zip(all_chunks, all_metas):
+                if meta.get("entry_type") == "search_chunk":
+                    chunks_content.append(doc)
+                    chunks_meta.append(meta)
+            
+            if not chunks_content:
+                await cl.Message(content=f"📝 Parent ID: `{parent_id}`\n\n⚠️ Không tìm thấy chunks con (có thể là ghi chú cũ trước khi có Sentence Window).").send()
+                return
+            
+            # 3. Hiển thị danh sách chunks
+            msg = f"🔍 **DEBUG: Sentence Window Chunks**\n\n"
+            msg += f"📌 **Parent ID:** `{parent_id}`\n"
+            msg += f"📄 **Entry Type:** `{entry_type}`\n"
+            msg += f"🧩 **Số lượng chunks:** {len(chunks_content)}\n\n"
+            msg += "---\n\n"
+            
+            for i, (chunk, meta) in enumerate(zip(chunks_content, chunks_meta), 1):
+                chunk_idx = meta.get("chunk_index", "?")
+                msg += f"**Chunk {i} (index: {chunk_idx}):**\n"
+                msg += f"```\n{chunk[:200]}{'...' if len(chunk) > 200 else ''}\n```\n\n"
+            
+            await cl.Message(content=msg).send()
+        else:
+            await cl.Message(content=f"ℹ️ Document này không phải parent_doc.\n\n**Entry Type:** `{entry_type}`\n**Parent ID:** `{parent_id or 'N/A'}`").send()
+            
+    except Exception as e:
+        print(f"❌ Lỗi trong _on_show_chunks_debug:")
+        traceback.print_exc()
+        await cl.Message(content=f"❌ Lỗi: {str(e)}").send()
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 872)
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1945)
 async def display_interactive_list(where_clause: dict, title: str):
@@ -3320,29 +3438,57 @@ async def _on_show_category_items(action: cl.Action):
         await cl.Message(content=f"❌ Lỗi _on_show_category_items: {e}").send()
             
 async def ui_show_all_memory():
-    """(MỚI) Hiển thị tất cả ghi chú (trừ file/image) với nút xóa."""
+    """(MỚI) Hiển thị tất cả ghi chú (trừ file/image) với nút xóa - CHỈ LẤY MASTER."""
     vectorstore = cl.user_session.get("vectorstore")
     if not vectorstore:
         await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
         return
     
-    # Phải chạy sync
+    # Phải chạy sync - Lấy tất cả text, sau đó lọc chunk
     def _get_docs_sync():
-        return vectorstore._collection.get(include=["documents"])
+        return vectorstore._collection.get(
+            where={"file_type": "text"},
+            include=["documents", "metadatas"]
+        )
     
     raw_data = await asyncio.to_thread(_get_docs_sync)
     
-    ids = raw_data.get("ids", [])
-    docs = raw_data.get("documents", [])
+    all_ids = raw_data.get("ids", [])
+    all_docs = raw_data.get("documents", [])
+    all_metadatas = raw_data.get("metadatas", [])
+    
+    # Lọc bỏ chunks (kiểm tra cả metadata và content)
+    ids, docs, metadatas = [], [], []
+    for i, (doc_id, doc, meta) in enumerate(zip(all_ids, all_docs, all_metadatas)):
+        entry_type = meta.get("entry_type", "")
+        
+        # BỎ QUA CHUNKS - Kiểm tra cả metadata VÀ content
+        is_chunk = (
+            entry_type in ["file_chunk", "search_chunk"] or 
+            "[NỘI DUNG CHUNK]" in doc or 
+            doc.startswith("Trích từ tài liệu:")
+        )
+        
+        if not is_chunk:
+            ids.append(doc_id)
+            docs.append(doc)
+            metadatas.append(meta)
     
     if not docs:
         await cl.Message(content="📭 Bộ nhớ đang trống. Chưa lưu gì cả.").send()
         return
 
     notes_found = 0
-    await cl.Message(content="📝 **Các ghi chú đã lưu (Văn bản):**").send()
+    await cl.Message(content="📝 **Các ghi chú đã lưu (Văn bản - Mới nhất lên đầu):**").send()
     
-    for doc_id, content in zip(ids, docs):
+    # Sắp xếp theo timestamp (nếu function helper có sẵn)
+    try:
+        sorted_results = _helper_sort_results_by_timestamp(ids, docs, metadatas)
+    except:
+        # Fallback: không sort
+        sorted_results = list(zip(ids, docs, metadatas))
+    
+    for doc_id, content, metadata in sorted_results:
         if not content: continue
         
         # --- BỘ LỌC ĐẦY ĐỦ ---
@@ -3370,6 +3516,17 @@ async def ui_show_all_memory():
                 label="🗑️ Xóa"
             )
         ]
+        
+        # 🔍 Thêm nút debug xem chunks (chỉ cho parent_doc)
+        entry_type = metadata.get("entry_type", "")
+        if entry_type == "parent_doc":
+            actions.append(
+                cl.Action(
+                    name="show_chunks_debug",
+                    payload={"doc_id": doc_id},
+                    label="🔍 Xem chunks"
+                )
+            )
         
         # 3. Logic hiển thị (Ngắn / Dài)
         # (Đặt 150 ký tự, hoặc nếu có xuống dòng)
@@ -3769,7 +3926,7 @@ async def _on_delete_reminder(action: cl.Action):
 
 # (Tìm hàm _on_delete_file và THAY THẾ bằng hàm này)
 @cl.action_callback("delete_file")
-async def _on_delete_file(action: cl.Action):
+async def _on_delete_file(action: cl.Action): 
     """
     SỬA LỖI TREO (9) & (10): Dùng cl.run_sync cho I/O (Chroma và os.remove)
     """
@@ -3778,7 +3935,7 @@ async def _on_delete_file(action: cl.Action):
         await cl.Message(content="❌ Lỗi: Không tìm thấy vectorstore.").send()
         return
 
-    data = action.payload
+    data = action.payload 
     if not data:
         await cl.Message(content="❌ Lỗi: Không nhận được payload khi hủy file.").send()
         return
@@ -4635,7 +4792,7 @@ def _build_rag_filter_from_query(query: str) -> Optional[dict]:
     file_keywords = [
         "file", "excel", "xlsx", "xls", "trang tinh", 
         "word", "docx", "doc", "van ban", 
-        "pdf", "tai lieu", "danh sach", "ds"
+        "pdf", "tai lieu"
     ]
     
     # (Dùng regex \b(word)\b để tìm từ riêng lẻ)
@@ -4918,35 +5075,63 @@ async def luu_thong_tin(noi_dung: str):
         )
         print(f"[luu_thong_tin] (Sửa lỗi V97) GPT (V88) trả về: Key='{fact_key}', Label='{fact_label}', CoreQuery='{core_query_term}'")
         
-        # --- 🚀 BƯỚC B: LƯU NỘI DUNG (OPTIMIZATION - NHANH) 🚀 ---
-        # STRATEGY: Với text dài, lưu NGUYÊN 1 CHUNK (không chia nhỏ)
-        # để tăng tốc embedding (giống NiceGUI)
+        # --- 🚀 BƯỚC B: SENTENCE WINDOW RETRIEVAL 🚀 ---
+        # STRATEGY: Lưu parent (toàn bộ) + chunks nhỏ (để search)
+        # → Search chính xác trong chunks, retrieve parent đầy đủ
         
         current_timestamp_iso = datetime.now(VN_TZ).isoformat()
         user_email = cl.user_session.get("user_email", "unknown")
         
-        metadata_base = {
+        # Tạo parent_id duy nhất cho document này
+        parent_id = f"parent_{user_id_str}_{uuid.uuid4().hex[:8]}"
+        
+        # B1: Lưu PARENT (bản gốc đầy đủ) - KHÔNG embedding
+        # Chỉ lưu vào metadata để retrieve sau
+        parent_metadata = {
             "user_id": user_email,
             "fact_key": fact_key,
             "fact_label": fact_label,
             "file_type": "text",
             "timestamp": current_timestamp_iso,
+            "entry_type": "parent_doc",
+            "parent_id": parent_id,
+            "full_content": original_text  # Lưu toàn bộ nội dung
         }
         
-        # OPTIMIZATION: Không chia nhỏ, lưu nguyên 1 chunk
-        # → Nhanh hơn 5-10 lần (chỉ 1 embedding call thay vì 6)
-        chunks = [original_text]
-        metadatas_list = [metadata_base]
+        # Lưu parent với placeholder text ngắn (để tiết kiệm embedding cost)
+        parent_placeholder = f"[PARENT] {fact_label}: {original_text[:100]}..."
         
-        print(f"[luu_thong_tin] (OPTIMIZATION) Lưu NGUYÊN 1 chunk ({len(original_text)} chars) - Không chia nhỏ để tăng tốc.")
+        # B2: Chia nhỏ thành chunks (sentences/paragraphs) để search
+        text_splitter = _get_text_splitter()
+        small_chunks = text_splitter.split_text(original_text)
         
-        # 3. Ghi CHUNKS (NỘI DUNG GỐC) vào Vectorstore
+        # Tạo metadata cho từng chunk (link về parent)
+        chunks_to_save = [parent_placeholder]  # Parent đầu tiên
+        metadatas_to_save = [parent_metadata]
+        
+        for idx, chunk in enumerate(small_chunks):
+            chunk_meta = {
+                "user_id": user_email,
+                "fact_key": fact_key,
+                "fact_label": fact_label,
+                "file_type": "text",
+                "timestamp": current_timestamp_iso,
+                "entry_type": "search_chunk",
+                "parent_id": parent_id,  # Link về parent
+                "chunk_index": idx
+            }
+            chunks_to_save.append(chunk)
+            metadatas_to_save.append(chunk_meta)
+        
+        print(f"[luu_thong_tin] (SENTENCE WINDOW) Lưu 1 parent + {len(small_chunks)} search chunks ({len(original_text)} chars)")
+        
+        # 3. Ghi TẤT CẢ (parent + chunks) vào Vectorstore
         await asyncio.to_thread(
             vectorstore.add_texts,
-            texts=chunks, # <-- Lưu 1 chunk (nội dung gốc nguyên)
-            metadatas=metadatas_list
+            texts=chunks_to_save,
+            metadatas=metadatas_to_save
         )
-        print(f"[luu_thong_tin] ✅ (OPTIMIZATION) Đã lưu 1 chunk vào shared DB (user_id={user_email}).")
+        print(f"[luu_thong_tin] ✅ Đã lưu với Sentence Window Retrieval (user_id={user_email})")
         
         # --- 🚀 BƯỚC C: LƯU VÀO CACHE (FACT_MAP) (Giữ nguyên) 🚀 ---
         if core_query_term and core_query_term.strip().lower() != "all":
@@ -4961,7 +5146,8 @@ async def luu_thong_tin(noi_dung: str):
             f"✅ Đã lưu ghi chú thành công!\n\n"
             f"**Chủ đề:** {fact_label}\n"
             f"**Số ký tự:** {len(original_text)}\n"
-            f"**Tối ưu:** Lưu 1 chunk nguyên (nhanh gấp 5-10 lần)"
+            f"**Sentence Window:** 1 parent + {len(small_chunks)} chunks\n"
+            f"**Lợi ích:** Search chính xác, retrieve đầy đủ ngữ cảnh"
         )
         
     except Exception as e:
@@ -5458,7 +5644,58 @@ async def setup_chat_session(user: cl.User):
                 
                 docs_goc_content = results.get("documents", [[]])[0] 
                 docs_goc_metadatas = results.get("metadatas", [[]])[0] 
-                ids_goc = results.get("ids", [[]])[0] 
+                ids_goc = results.get("ids", [[]])[0]
+                
+                # --- 🚀 SENTENCE WINDOW RETRIEVAL: Lấy parent khi tìm thấy chunk 🚀 ---
+                final_docs = []
+                final_metas = []
+                seen_parents = set()  # Tránh trùng parent
+                
+                for doc, meta in zip(docs_goc_content, docs_goc_metadatas):
+                    entry_type = meta.get("entry_type", "")
+                    
+                    if entry_type == "search_chunk":
+                        # Tìm thấy chunk → lấy parent
+                        parent_id = meta.get("parent_id")
+                        if parent_id and parent_id not in seen_parents:
+                            # Query parent document - ChromaDB chỉ cho 1 điều kiện where
+                            parent_result = await asyncio.to_thread(
+                                vectorstore._collection.get,
+                                where={"parent_id": parent_id},
+                                include=["metadatas"]
+                            )
+                            
+                            # Lọc để tìm parent_doc (có thể có cả search_chunk cùng parent_id)
+                            if parent_result and parent_result.get("metadatas"):
+                                for p_meta in parent_result["metadatas"]:
+                                    if p_meta.get("entry_type") == "parent_doc":
+                                        parent_content = p_meta.get("full_content", doc)
+                                        final_docs.append(parent_content)
+                                        final_metas.append(p_meta)
+                                        seen_parents.add(parent_id)
+                                        print(f"[SENTENCE WINDOW] Chunk found → Retrieved parent: {parent_id[:30]}...")
+                                        break
+                                else:
+                                    # Không tìm thấy parent_doc → giữ chunk
+                                    final_docs.append(doc)
+                                    final_metas.append(meta)
+                            else:
+                                # Query thất bại → giữ chunk
+                                final_docs.append(doc)
+                                final_metas.append(meta)
+                        else:
+                            # Parent đã lấy rồi hoặc không có parent_id
+                            if parent_id not in seen_parents:
+                                final_docs.append(doc)
+                                final_metas.append(meta)
+                    else:
+                        # Không phải chunk → giữ nguyên
+                        final_docs.append(doc)
+                        final_metas.append(meta)
+                
+                docs_goc_content = final_docs
+                docs_goc_metadatas = final_metas
+                # --- 🚀 KẾT THÚC SENTENCE WINDOW RETRIEVAL 🚀 --- 
                 
                 if not docs_goc_content:
                     return f"ℹ️ Đã tìm (Query V96: '{search_vector_query}', Filter: Where={final_where_for_chroma}) nhưng không tìm thấy."

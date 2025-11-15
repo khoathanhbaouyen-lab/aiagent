@@ -83,12 +83,18 @@ def download_file():
     """API để tải file gốc (không bị zip)"""
     try:
         file_path = request.args.get('file_path')
+        filename_param = request.args.get('filename')  # optional: original filename from client
+        
+        # DEBUG: In ra để kiểm tra
+        print(f"[DEBUG Download] Received file_path: {file_path}")
+        print(f"[DEBUG Download] File exists: {os.path.exists(file_path) if file_path else 'None'}")
         
         if not file_path or not os.path.exists(file_path):
+            print(f"[DEBUG Download] ERROR: File not found or path is None")
             return jsonify({"error": "File not found"}), 404
         
-        # Lấy tên file gốc
-        filename = os.path.basename(file_path)
+        # Lấy tên file gốc (ưu tiên tên gốc truyền lên nếu có)
+        filename = filename_param or os.path.basename(file_path)
         
         # Detect mimetype
         import mimetypes

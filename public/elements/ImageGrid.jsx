@@ -48,15 +48,16 @@ export default function ImageGrid() {
           doc_id: img.doc_id,
           file_path: img.file_path || img.path
         })
-      });
-      
-      if (response.ok) {
-        setItems(prev => prev.filter(i => i.doc_id !== img.doc_id));
-        setLightbox(null);
-        setSelectedItem(null);
-        alert('✅ Đã xóa ảnh thành công!');
-      } else {
-        alert('❌ Lỗi khi xóa ảnh');
+            <a
+              href={`http://localhost:8001/api/download-file?file_path=${encodeURIComponent(lightbox.file_path || lightbox.path || lightbox.url)}&filename=${encodeURIComponent(lightbox.name || '')}`}
+              className="ig-lightbox-btn"
+              title="Tải xuống"
+              onClick={(e) => e.stopPropagation()}
+              target="_blank"
+              rel="noreferrer"
+            >
+              📥
+            </a>
       }
     } catch (err) {
       console.error('Lỗi API:', err);
