@@ -11,6 +11,11 @@ langchain-chroma
 # Vectorstore DB
 chromadb
 
+# PostgreSQL & pgvector
+psycopg2-binary
+pgvector
+langchain-postgres
+
 # File Processing
 pandas
 openpyxl

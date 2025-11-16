@@ -17,10 +17,13 @@ import docx # từ python-docx
 import pypdf
 import unidecode
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
+from langchain_chroma import Chroma  # Keep for backward compatibility
+from langchain_postgres import PGVector
+from langchain_postgres.vectorstores import PGVector as PGVectorStore
 from langchain_openai import OpenAIEmbeddings
 # from langchain_huggingface import HuggingFaceEmbeddings  # ⚠️ DISABLED: PyTorch conflict
 from langchain_core.prompts import PromptTemplate
+from postgres_utils import get_postgres_connection_string, init_connection_pool, test_connection, init_pgvector_extension
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from bs4 import BeautifulSoup
@@ -137,31 +140,48 @@ PUSH_TIMEOUT = int(os.getenv("PUSH_TIMEOUT", "15"))
 # Timezone VN
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 
-# Cache vectorstore toàn cục (chỉ khởi tạo 1 lần)
+# Cache vectorstore toàn cục (chỉ khởi tạo 1 lần) - Migrated to PostgreSQL
 _SHARED_VECTORSTORE_CL = None
+_PGVECTOR_COLLECTION_NAME = "shared_memory"
+_PGVECTOR_TABLE_NAME = "langchain_pg_embedding"
 # Global Scheduler (khởi tạo 1 lần)
 SCHEDULER: Optional[AsyncIOScheduler] = None
-# Cấu hình nơi lưu trữ job (database)
-jobstores = {
-    'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBSTORE_DB_FILE}')
-}
+
+# Cấu hình nơi lưu trữ job (database) - MIGRATED TO PostgreSQL
+try:
+    from postgres_utils import get_postgres_connection_string as pg_conn_str
+    jobstores = {
+        'default': SQLAlchemyJobStore(url=pg_conn_str())
+    }
+    print("✅ [APScheduler] Sử dụng PostgreSQL jobstore")
+except Exception as e:
+    print(f"⚠️ [APScheduler] Lỗi kết nối PostgreSQL: {e}. Fallback sang SQLite...")
+    jobstores = {
+        'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBSTORE_DB_FILE}')
+    }
+    print(f"✅ [APScheduler] Sử dụng SQLite jobstore tại {JOBSTORE_DB_FILE}")
 
 # Theo dõi các “escalating reminders” đang chạy theo từng session
 ACTIVE_ESCALATIONS = {}  # { internal_session_id: { "repeat_job_id": str, "acked": bool } }
 
 # =========================================================
-#  V108: DATA LAYER - CHAT HISTORY (ENABLED - SQLite)
+#  V108: DATA LAYER - CHAT HISTORY (MIGRATED TO PostgreSQL)
 # =========================================================
-from data_layer import SQLiteDataLayer
-
-# Khởi tạo Data Layer
-cl_data_layer = SQLiteDataLayer(db_path="memory_db/chainlit_history.db")
+try:
+    from data_layer_postgres import PostgreSQLDataLayer
+    cl_data_layer = PostgreSQLDataLayer()
+    print("✅ [DataLayer] Sử dụng PostgreSQL")
+except Exception as e:
+    print(f"⚠️ [DataLayer] Lỗi kết nối PostgreSQL: {e}. Fallback sang SQLite...")
+    from data_layer import SQLiteDataLayer
+    cl_data_layer = SQLiteDataLayer(db_path="memory_db/chainlit_history.db")
+    print("✅ [DataLayer] Sử dụng SQLite (Fallback)")
 
 # =========================================================
 # 🔐 MỚI: Quản lý CSDL User (SQLite + Werkzeug)
 # =========================================================
 # (Dán vào khoảng dòng 130)
-
+e
 # --- 🚀 BẮT ĐẦU: CẤU HÌNH AVATAR HELPER (V47) 🚀 ---
 
 def _sanitize_email_for_path(email: str) -> str:
@@ -418,17 +438,29 @@ async def on_start_after_login():
     cl.user_session.set("user_email", user_email)  # Lưu email vào session
     print(f"✅ [on_chat_start] User email: {user_email}")
     
-    # --- KHỞI TẠO SHARED VECTORSTORE (1 DB DUY NHẤT CHO TẤT CẢ USER) ---
+    # --- KHỞI TẠO SHARED VECTORSTORE (MIGRATED TO PostgreSQL + pgvector) ---
     global _SHARED_VECTORSTORE_CL
     
     if _SHARED_VECTORSTORE_CL is None:
         print("[Shared DB] Đang khởi tạo Shared VectorStore lần đầu...")
-        _SHARED_VECTORSTORE_CL = Chroma(
-            persist_directory=SHARED_VECTOR_DB_DIR,
-            embedding_function=embeddings,
-            collection_name="shared_memory"
-        )
-        print(f"✅ [Shared DB] Shared VectorStore đã khởi tạo tại {SHARED_VECTOR_DB_DIR}")
+        try:
+            # Try PGVector first
+            connection_string = get_postgres_connection_string()
+            _SHARED_VECTORSTORE_CL = PGVectorStore(
+                connection=connection_string,
+                embeddings=embeddings,
+                collection_name=_PGVECTOR_COLLECTION_NAME,
+                use_jsonb=True,
+            )
+            print(f"✅ [PGVector] Shared VectorStore đã khởi tạo (PostgreSQL)")
+        except Exception as e:
+            print(f"⚠️ [PGVector] Lỗi: {e}. Fallback sang ChromaDB...")
+            _SHARED_VECTORSTORE_CL = Chroma(
+                persist_directory=SHARED_VECTOR_DB_DIR,
+                embedding_function=embeddings,
+                collection_name="shared_memory"
+            )
+            print(f"✅ [ChromaDB] Shared VectorStore đã khởi tạo tại {SHARED_VECTOR_DB_DIR}")
     else:
         print(f"[Shared DB] Sử dụng lại Shared VectorStore đã có (user: {user_email})")
     
@@ -437,7 +469,7 @@ async def on_start_after_login():
     retriever = _SHARED_VECTORSTORE_CL.as_retriever(search_kwargs={"k": 100})
     cl.user_session.set("retriever", retriever)
     
-    print(f"✅ VectorStore cho user '{user_email}' đã sẵn sàng tại {SHARED_VECTOR_DB_DIR} (mode=Similarity K=100)")
+    print(f"✅ VectorStore cho user '{user_email}' đã sẵn sàng (mode=Similarity K=100)")
     
     # 2. Khởi tạo Tổng đài (như cũ)
     global GLOBAL_MESSAGE_QUEUE, POLLER_STARTED
@@ -2079,9 +2111,23 @@ else:
         show_progress_bar=False,
         chunk_size=100
     )
-def get_shared_vectorstore_retriever() -> Tuple[Chroma, Any]:
+
+# 🚀 PostgreSQL + pgvector Initialization
+print("🔌 [PostgreSQL] Kiểm tra kết nối PostgreSQL...")
+try:
+    init_connection_pool(min_conn=2, max_conn=20)
+    if test_connection():
+        print("✅ [PostgreSQL] Kết nối thành công")
+        init_pgvector_extension()
+        print("✅ [pgvector] Extension đã được kích hoạt")
+    else:
+        print("❌ [PostgreSQL] Không thể kết nối. Fallback sang ChromaDB (SQLite)")
+except Exception as e:
+    print(f"❌ [PostgreSQL] Lỗi khởi tạo: {e}")
+    print("⚠️  Fallback sang ChromaDB (SQLite)")
+def get_shared_vectorstore_retriever() -> Tuple[Any, Any]:
     """
-    (MỚI - 1 DB CHUNG)
+    (MỚI - 1 DB CHUNG - MIGRATED TO PostgreSQL + pgvector)
     Khởi tạo Vectorstore CHUNG cho TẤT CẢ user.
     Filter theo metadata['user_id'] khi query.
     """
@@ -2094,18 +2140,38 @@ def get_shared_vectorstore_retriever() -> Tuple[Chroma, Any]:
     if embeddings is None:
         raise ValueError("Lỗi: Embeddings chưa được khởi tạo (OPENAI_API_KEY có thể bị thiếu).")
     
-    # Khởi tạo 1 lần duy nhất
-    _SHARED_VECTORSTORE = Chroma(
-        persist_directory=SHARED_VECTOR_DB_DIR,
-        embedding_function=embeddings,
-        collection_name="shared_memory"  # Collection chung
-    )
-    
-    # Retriever không filter (sẽ filter sau khi query)
-    _SHARED_RETRIEVER = _SHARED_VECTORSTORE.as_retriever(search_kwargs={"k": 100})
-    
-    print(f"✅ Shared VectorStore đã sẵn sàng tại {SHARED_VECTOR_DB_DIR}")
-    return _SHARED_VECTORSTORE, _SHARED_RETRIEVER
+    try:
+        # 🚀 Khởi tạo PGVector (PostgreSQL + pgvector)
+        connection_string = get_postgres_connection_string()
+        
+        _SHARED_VECTORSTORE = PGVectorStore(
+            connection=connection_string,
+            embeddings=embeddings,
+            collection_name=_PGVECTOR_COLLECTION_NAME,
+            use_jsonb=True,  # Sử dụng JSONB cho metadata (tối ưu query)
+        )
+        
+        # Retriever không filter (sẽ filter sau khi query)
+        _SHARED_RETRIEVER = _SHARED_VECTORSTORE.as_retriever(search_kwargs={"k": 100})
+        
+        print(f"✅ [PGVector] Shared VectorStore đã sẵn sàng (PostgreSQL collection: {_PGVECTOR_COLLECTION_NAME})")
+        return _SHARED_VECTORSTORE, _SHARED_RETRIEVER
+        
+    except Exception as e:
+        print(f"❌ [PGVector] Lỗi khởi tạo: {e}")
+        print("⚠️  Fallback sang ChromaDB (SQLite)...")
+        
+        # Fallback to ChromaDB
+        _SHARED_VECTORSTORE = Chroma(
+            persist_directory=SHARED_VECTOR_DB_DIR,
+            embedding_function=embeddings,
+            collection_name="shared_memory"  # Collection chung
+        )
+        
+        _SHARED_RETRIEVER = _SHARED_VECTORSTORE.as_retriever(search_kwargs={"k": 100})
+        
+        print(f"✅ [ChromaDB] Shared VectorStore đã sẵn sàng tại {SHARED_VECTOR_DB_DIR} (Fallback mode)")
+        return _SHARED_VECTORSTORE, _SHARED_RETRIEVER
 
 
 # ---------------------------------------------------------
