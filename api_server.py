@@ -75,26 +75,115 @@ def edit_file():
         return jsonify({"success": True, "message": "Đã cập nhật (chức năng đang phát triển)"})
         
     except Exception as e:
-        print(f"❌ [API] Lỗi edit_file: {e}")
+        print(f"❌ [API] Lỗi edit_file: {e}") 
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/download-file', methods=['GET'])
 def download_file():
-    """API để tải file gốc (không bị zip)"""
+    """API để tải file gốc (không bị zip) - SỬA LỖI: Xử lý khi file_path là thư mục"""
     try:
         file_path = request.args.get('file_path')
-        filename_param = request.args.get('filename')  # optional: original filename from client
+        filename_param = request.args.get('filename')  # optional: original filename from client 
         
         # DEBUG: In ra để kiểm tra
-        print(f"[DEBUG Download] Received file_path: {file_path}")
-        print(f"[DEBUG Download] File exists: {os.path.exists(file_path) if file_path else 'None'}")
+        print(f"\n[DEBUG Download] ========== START ==========")
+        print(f"[DEBUG Download] Received file_path: '{file_path}'")
+        print(f"[DEBUG Download] Received filename: '{filename_param}'")
         
-        if not file_path or not os.path.exists(file_path):
-            print(f"[DEBUG Download] ERROR: File not found or path is None")
-            return jsonify({"error": "File not found"}), 404
+        if not file_path:
+            print(f"[DEBUG Download] ERROR: file_path is None or empty")
+            return jsonify({"error": "file_path parameter is missing"}), 400
+        
+        # ===== SỬA LỖI: XỬ LÝ KHI file_path LÀ THƯ MỤC HOẶC FILE KHÔNG TỒN TẠI =====
+        # Chuẩn hóa đường dẫn (chuyển / thành \ trên Windows)
+        file_path = os.path.normpath(file_path)
+        print(f"[DEBUG Download] Normalized file_path: '{file_path}'")
+        
+        if os.path.isdir(file_path):
+            print(f"[DEBUG Download] WARNING: file_path is a DIRECTORY: '{file_path}'")
+            print(f"[DEBUG Download] Trying to find file in public/files using filename: '{filename_param}'")
+            
+            # Nếu file_path là thư mục, tìm file trong thư mục public/files
+            # bằng cách dùng filename_param
+            if filename_param:
+                # Thử tìm file trong PUBLIC_FILES_DIR
+                potential_path = os.path.join(PUBLIC_FILES_DIR, filename_param)
+                print(f"[DEBUG Download] Checking potential path: '{potential_path}'")
+                
+                if os.path.isfile(potential_path):
+                    print(f"[DEBUG Download] Found file at: '{potential_path}'")
+                    file_path = potential_path
+                else:
+                    # Thử tìm file có tên tương tự trong PUBLIC_FILES_DIR
+                    print(f"[DEBUG Download] Searching for similar files in PUBLIC_FILES_DIR...")
+                    found = False
+                    for f in os.listdir(PUBLIC_FILES_DIR):
+                        if filename_param.lower() in f.lower():
+                            file_path = os.path.join(PUBLIC_FILES_DIR, f)
+                            print(f"[DEBUG Download] Found similar file: '{file_path}'")
+                            found = True
+                            break
+                    
+                    if not found:
+                        print(f"[DEBUG Download] ERROR: Could not find file in PUBLIC_FILES_DIR")
+                        return jsonify({
+                            "error": f"Path is a directory and could not find file: {filename_param}"
+                        }), 400
+            else:
+                print(f"[DEBUG Download] ERROR: Path is a directory and no filename provided")
+                return jsonify({"error": f"Path is a directory: {file_path}"}), 400
+        
+        # Kiểm tra xem file có tồn tại không, nếu không thì tìm trong PUBLIC_FILES_DIR
+        if not os.path.exists(file_path):
+            print(f"[DEBUG Download] WARNING: File does not exist at: '{file_path}'")
+            if filename_param:
+                # Lấy chỉ tên file từ file_path (bỏ đường dẫn)
+                basename = os.path.basename(file_path)
+                potential_path = os.path.join(PUBLIC_FILES_DIR, basename)
+                print(f"[DEBUG Download] Trying with basename in PUBLIC_FILES_DIR: '{potential_path}'")
+                
+                if os.path.isfile(potential_path):
+                    print(f"[DEBUG Download] Found file at: '{potential_path}'")
+                    file_path = potential_path
+                else:
+                    print(f"[DEBUG Download] File still not found. Searching for similar files...")
+                    found = False
+                    for f in os.listdir(PUBLIC_FILES_DIR):
+                        if basename.lower() in f.lower() or filename_param.lower() in f.lower():
+                            file_path = os.path.join(PUBLIC_FILES_DIR, f)
+                            print(f"[DEBUG Download] Found similar file: '{file_path}'")
+                            found = True
+                            break
+                    
+                    if not found:
+                        print(f"[DEBUG Download] ERROR: Could not find file anywhere")
+                        return jsonify({"error": f"File not found: {file_path}"}), 404
+        # ===== KẾT THÚC SỬA LỖI =====
+        
+        print(f"[DEBUG Download] Final file_path: '{file_path}'")
+        print(f"[DEBUG Download] File exists: {os.path.exists(file_path)}")
+        print(f"[DEBUG Download] Is file: {os.path.isfile(file_path)}")
+            
+        if not os.path.exists(file_path):
+            print(f"[DEBUG Download] ERROR: File not found at: {file_path}")
+            return jsonify({"error": f"File not found: {file_path}"}), 404
+            
+        if not os.path.isfile(file_path):
+            print(f"[DEBUG Download] ERROR: Path is not a file!")
+            return jsonify({"error": f"Path is not a file: {file_path}"}), 400
         
         # Lấy tên file gốc (ưu tiên tên gốc truyền lên nếu có)
         filename = filename_param or os.path.basename(file_path)
+        
+        # ===== SỬA LỖI: THÊM EXTENSION VÀO FILENAME =====
+        # Nếu filename không có extension, lấy từ file_path
+        if filename and '.' not in filename:
+            ext = os.path.splitext(file_path)[1]
+            if ext:
+                filename = filename + ext
+                print(f"[DEBUG Download] Added extension: '{ext}' to filename")
+        
+        print(f"[DEBUG Download] Final filename: '{filename}'")
         
         # Detect mimetype
         import mimetypes
@@ -102,16 +191,24 @@ def download_file():
         if not mimetype:
             mimetype = 'application/octet-stream'
         
+        print(f"[DEBUG Download] Mimetype: {mimetype}")
+        print(f"[DEBUG Download] Sending file...")
+        
         # Stream file trực tiếp về browser với mimetype đúng
         from flask import send_file
-        return send_file(
+        result = send_file(
             file_path,
             as_attachment=True,
             download_name=filename,
             mimetype=mimetype
         )
         
+        print(f"[DEBUG Download] ========== SUCCESS ==========\n")
+        return result
+        
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"❌ [API] Lỗi download_file: {e}")
         return jsonify({"error": str(e)}), 500
 
