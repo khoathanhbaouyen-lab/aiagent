@@ -6,9 +6,27 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import sqlite3
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.date import DateTrigger
+import pytz
 
 app = Flask(__name__)
 CORS(app)  # Cho phép CORS để CustomElement có thể gọi
+
+# APScheduler instance
+SCHEDULER = None
+VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+
+def init_scheduler():
+    """Khởi tạo scheduler nếu chưa có"""
+    global SCHEDULER
+    if SCHEDULER is None:
+        SCHEDULER = BackgroundScheduler(timezone=VN_TZ)
+        SCHEDULER.start()
+        print("✅ [API] Scheduler started")
 
 # Cấu hình (phải giống app.py)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +37,80 @@ def get_vectorstore_connection():
     # Sửa đường dẫn này cho đúng với cấu trúc của bạn
     db_path = os.path.join(BASE_DIR, "user_data", "shared_vector_db", "chroma.sqlite3")
     return sqlite3.connect(db_path)
+
+def parse_rrule_to_trigger(rrule_str, start_time):
+    """
+    Parse RRULE string thành APScheduler trigger
+    Format: TYPE:REPEAT;FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,FR;COUNT=10
+    """
+    if not rrule_str:
+        return None, None
+    
+    parts = rrule_str.split(';')
+    rule_dict = {}
+    
+    for part in parts:
+        if ':' in part:
+            key, val = part.split(':', 1)
+            rule_dict[key.upper()] = val.upper()
+        elif '=' in part:
+            key, val = part.split('=', 1)
+            rule_dict[key.upper()] = val
+    
+    recur_type = rule_dict.get('TYPE', 'REPEAT')  # REPEAT or REMIND
+    freq = rule_dict.get('FREQ', '').upper()
+    interval = int(rule_dict.get('INTERVAL', 1))
+    
+    if freq == 'MINUTELY':
+        trigger = IntervalTrigger(minutes=interval, start_date=start_time, timezone=VN_TZ)
+    elif freq == 'HOURLY':
+        trigger = IntervalTrigger(hours=interval, start_date=start_time, timezone=VN_TZ)
+    elif freq == 'DAILY':
+        trigger = IntervalTrigger(days=interval, start_date=start_time, timezone=VN_TZ)
+    elif freq == 'WEEKLY':
+        # Parse BYDAY (MO,TU,WE,TH,FR,SA,SU)
+        byday_str = rule_dict.get('BYDAY', '')
+        day_map = {'MO': 'mon', 'TU': 'tue', 'WE': 'wed', 'TH': 'thu', 'FR': 'fri', 'SA': 'sat', 'SU': 'sun'}
+        days = [day_map[d.strip()] for d in byday_str.split(',') if d.strip() in day_map]
+        
+        if not days:
+            days = None  # Every day
+        
+        # Extract hour and minute from start_time
+        hour = start_time.hour
+        minute = start_time.minute
+        
+        trigger = CronTrigger(
+            day_of_week=','.join(days) if days else None,
+            hour=hour,
+            minute=minute,
+            timezone=VN_TZ
+        )
+    elif freq == 'MONTHLY':
+        trigger = IntervalTrigger(weeks=4*interval, start_date=start_time, timezone=VN_TZ)
+    elif freq == 'YEARLY':
+        trigger = IntervalTrigger(days=365*interval, start_date=start_time, timezone=VN_TZ)
+    else:
+        # Once (no recurrence)
+        trigger = DateTrigger(run_date=start_time, timezone=VN_TZ)
+    
+    return trigger, recur_type
+
+def task_reminder_job(task_id, recur_type):
+    """Job callback khi đến hạn task"""
+    print(f"⏰ [Scheduler] Task #{task_id} triggered (type: {recur_type})")
+    
+    # TODO: Gửi notification tới user (qua Chainlit hoặc push notification)
+    # Nếu TYPE:REPEAT → Tạo task mới
+    # Nếu TYPE:REMIND → Chỉ gửi thông báo
+    
+    if recur_type == 'REPEAT':
+        print(f"🔁 [Scheduler] Creating new task from #{task_id}")
+        # Clone task with new due_date
+        # tm.create_task(...)
+    else:
+        print(f"🔔 [Scheduler] Sending reminder for task #{task_id}")
+        # Just notify, don't create new task
 
 @app.route('/api/delete-file', methods=['POST'])
 def delete_file():
@@ -217,8 +309,206 @@ def health():
     """Health check endpoint"""
     return jsonify({"status": "ok"})
 
+@app.route('/api/get-users', methods=['GET'])
+def get_users():
+    """API để lấy danh sách users cho dropdown assign"""
+    try:
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import task_manager as tm
+        
+        users = tm.get_all_users()
+        return jsonify({"success": True, "users": users})
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [API] Lỗi get_users: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/edit-task', methods=['POST'])
+def edit_task():
+    """API để sửa task từ TaskGrid"""
+    try:
+        data = request.json
+        print(f"\n[DEBUG] Received data: {data}\n")
+        
+        task_id = data.get('task_id')
+        title = data.get('title')
+        description = data.get('description')
+        due_date = data.get('due_date')
+        priority = data.get('priority')
+        tags = data.get('tags')  # List
+        recurrence_rule = data.get('recurrence_rule')  # RRULE string
+        assigned_to = data.get('assigned_to')  # Comma-separated emails
+        
+        if not task_id:
+            return jsonify({"error": "Missing task_id"}), 400
+        
+        # Import task_manager
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import task_manager as tm
+        
+        print(f"[DEBUG] Updating task #{task_id}...")
+        print(f"  - due_date: {due_date}")
+        print(f"  - assigned_to: {assigned_to}")
+        print(f"  - recurrence_rule: {recurrence_rule}")
+        
+        # Update task
+        success = tm.update_task(
+            task_id=task_id,
+            title=title if title else None,
+            description=description if description else None,
+            due_date=due_date if due_date else None,
+            priority=priority if priority else None,
+            tags=tags if tags else None,
+            assigned_to=assigned_to,
+            recurrence_rule=recurrence_rule
+        )
+        
+        print(f"[DEBUG] Update result: {success}")
+        
+        if success:
+            print(f"✅ [API] Đã cập nhật task #{task_id} (recurrence: {recurrence_rule}, assigned_to: {assigned_to})")
+            
+            # Update scheduler with RRULE logic
+            if recurrence_rule and due_date:
+                try:
+                    init_scheduler()
+                    
+                    # Remove old job if exists
+                    job_id = f"task-{task_id}"
+                    try:
+                        SCHEDULER.remove_job(job_id)
+                        print(f"🗑️ [Scheduler] Removed old job: {job_id}")
+                    except:
+                        pass
+                    
+                    # Parse due_date
+                    if isinstance(due_date, str):
+                        # Try multiple formats
+                        for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%dT%H:%M']:
+                            try:
+                                start_time = datetime.strptime(due_date, fmt)
+                                break
+                            except:
+                                continue
+                        else:
+                            print(f"⚠️ [Scheduler] Invalid date format: {due_date}")
+                            return jsonify({"success": True, "message": f"Đã cập nhật task #{task_id} (no scheduler)"})
+                    else:
+                        start_time = due_date
+                    
+                    start_time = VN_TZ.localize(start_time) if start_time.tzinfo is None else start_time
+                    
+                    # Parse RRULE and create trigger
+                    trigger, recur_type = parse_rrule_to_trigger(recurrence_rule, start_time)
+                    
+                    if trigger:
+                        SCHEDULER.add_job(
+                            task_reminder_job,
+                            trigger=trigger,
+                            id=job_id,
+                            args=[task_id, recur_type],
+                            replace_existing=True
+                        )
+                        print(f"✅ [Scheduler] Added job: {job_id} with trigger: {trigger}")
+                except Exception as e:
+                    print(f"⚠️ [Scheduler] Failed to update: {e}")
+            
+            return jsonify({"success": True, "message": f"Đã cập nhật task #{task_id}"})
+        else:
+            return jsonify({"error": "Task not found or no changes"}), 404
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [API] Lỗi edit_task: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/delete-task', methods=['POST'])
+def delete_task():
+    """API để xóa task từ TaskGrid"""
+    try:
+        data = request.json
+        task_id = data.get('task_id')
+        
+        if not task_id:
+            return jsonify({"error": "Missing task_id"}), 400
+        
+        # Import task_manager
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import task_manager as tm
+        
+        # Get user_email from session (trong thực tế cần auth token)
+        # Tạm thời dùng user_email từ request hoặc default
+        user_email = data.get('user_email', 'default@local')
+        
+        success = tm.delete_task(task_id, user_email)
+        
+        if success:
+            print(f"✅ [API] Đã xóa task #{task_id}")
+            return jsonify({"success": True, "message": f"Đã xóa task #{task_id}"})
+        else:
+            return jsonify({"error": "Task not found"}), 404
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [API] Lỗi delete_task: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/complete-task', methods=['POST'])
+def complete_task():
+    """API để đánh dấu hoàn thành task từ TaskGrid"""
+    try:
+        data = request.json
+        task_id = data.get('task_id')
+        
+        if not task_id:
+            return jsonify({"error": "Missing task_id"}), 400
+        
+        # Import task_manager
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import task_manager as tm
+        
+        # Get user_email from session
+        user_email = data.get('user_email', 'default@local')
+        
+        success = tm.mark_complete(task_id, user_email)
+        
+        if success:
+            print(f"✅ [API] Đã hoàn thành task #{task_id}")
+            return jsonify({"success": True, "message": f"Đã hoàn thành task #{task_id}"})
+        else:
+            return jsonify({"error": "Task not found"}), 404
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [API] Lỗi complete_task: {e}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     print("🚀 API Server đang chạy trên http://localhost:8001")
-    print("   - DELETE: POST /api/delete-file")
-    print("   - EDIT:   POST /api/edit-file")
+    print("   - DELETE FILE: POST /api/delete-file")
+    print("   - EDIT FILE:   POST /api/edit-file")
+    print("   - EDIT TASK:   POST /api/edit-task")
+    print("   - DELETE TASK: POST /api/delete-task")
+    print("   - COMPLETE TASK: POST /api/complete-task")
+    print("   - GET USERS:   GET  /api/get-users")
+    print()
+    
+    # Initialize scheduler
+    init_scheduler()
+    print("✅ Scheduler initialized and ready")
+    print()
+    
     app.run(host='0.0.0.0', port=8001, debug=False)

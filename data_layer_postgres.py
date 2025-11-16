@@ -465,3 +465,14 @@ class PostgreSQLDataLayer(BaseDataLayer):
     async def delete_element(self, element_id: str):
         """Stub: Delete element (not implemented for PostgreSQL)."""
         pass
+    
+    # ============================================================
+    # REQUIRED ABSTRACT METHOD (Chainlit 2.3+)
+    # ============================================================
+    
+    def build_debug_url(self) -> str:
+        """
+        Build debug URL for Chainlit UI.
+        Returns empty string as PostgreSQL doesn't have a web UI.
+        """
+        return ""

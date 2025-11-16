@@ -181,7 +181,7 @@ except Exception as e:
 # 🔐 MỚI: Quản lý CSDL User (SQLite + Werkzeug)
 # =========================================================
 # (Dán vào khoảng dòng 130)
-e
+
 # --- 🚀 BẮT ĐẦU: CẤU HÌNH AVATAR HELPER (V47) 🚀 ---
 
 def _sanitize_email_for_path(email: str) -> str:
@@ -488,7 +488,38 @@ async def on_start_after_login():
         except Exception as e:
             print(f"❌ [Global] Lỗi khởi động Tổng đài: {e}")
 
-    # 3. Gọi hàm setup chat chính
+    # 3. Hiển thị TaskList khi khởi động
+    task_list = cl.TaskList()
+    task_list.status = "Đang khởi tạo..."
+    
+    task1 = cl.Task(title="Kết nối Database", status=cl.TaskStatus.RUNNING)
+    await task_list.add_task(task1)
+    
+    task2 = cl.Task(title="Load VectorStore", status=cl.TaskStatus.READY)
+    await task_list.add_task(task2)
+    
+    task3 = cl.Task(title="Khởi tạo Agent", status=cl.TaskStatus.READY)
+    await task_list.add_task(task3)
+    
+    await task_list.send()
+    
+    # Simulate progress
+    await asyncio.sleep(0.5)
+    task1.status = cl.TaskStatus.DONE
+    task2.status = cl.TaskStatus.RUNNING
+    await task_list.send()
+    
+    await asyncio.sleep(0.5)
+    task2.status = cl.TaskStatus.DONE
+    task3.status = cl.TaskStatus.RUNNING
+    await task_list.send()
+    
+    await asyncio.sleep(0.5)
+    task3.status = cl.TaskStatus.DONE
+    task_list.status = "✅ Sẵn sàng"
+    await task_list.send()
+    
+    # 4. Gọi hàm setup chat chính
     await setup_chat_session(user)
 
 @cl.on_chat_resume
@@ -648,7 +679,7 @@ def init_user_db():
     """)
     conn.commit()
     conn.close()
-    # === MỚI: Thêm bảng cho Checklist Công việc ===
+    # === MỚI: Thêm bảng cho Checklist Công việc (V2: Priority + Tags + Assign) ===
     conn = _get_user_db_conn() # Mở lại kết nối
     cursor = conn.cursor()
     cursor.execute("""
@@ -661,7 +692,11 @@ def init_user_db():
         is_completed INTEGER DEFAULT 0 NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         recurrence_rule TEXT,
-        scheduler_job_id TEXT 
+        scheduler_job_id TEXT,
+        priority TEXT DEFAULT 'medium',
+        tags TEXT,
+        assigned_to TEXT,
+        assigned_by TEXT
     );
     """)
     conn.commit()
@@ -1764,63 +1799,7 @@ async def ui_show_completed_tasks():
         msg.actions = actions
         await msg.send()
 # (Dán hàm MỚI này vào khoảng dòng 2465)
-@cl.action_callback("delete_task")
-async def _on_delete_task(action: cl.Action):
-    """(MỚI) Xử lý khi bấm nút 'Xóa' công việc."""
-    user_id_str = cl.user_session.get("user_id_str")
-    if not user_id_str:
-        await cl.Message(content="❌ Lỗi: Không tìm thấy user_id_str.").send()
-        return
-
-    task_id = action.payload.get("task_id")
-    message_id = action.payload.get("message_id") 
-    
-    if not task_id:
-        await cl.Message(content="❌ Lỗi: Không nhận được task_id.").send()
-        return
-
-    try:
-        # --- 🚀 BẮT ĐẦU SỬA LỖI (ĐỔI TÊN HÀM) 🚀 ---
-        # Gọi hàm xóa theo ID (đã có ở dòng 769)
-        ok = await asyncio.to_thread(_delete_task_db_by_id, task_id, user_id_str)
-        # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
-        
-        if ok:
-            # Note: Chainlit không hỗ trợ xóa message đã gửi
-            # Chỉ gửi thông báo xác nhận
-            await cl.Message(content=f"🗑️ Đã xóa công việc!").send()
-        else:
-            await cl.Message(content=f"⚠️ Không thể xóa công việc (ID: {task_id}).").send()
-    except Exception as e:
-        await cl.Message(content=f"❌ Lỗi khi xóa công việc: {e}").send()
-        
-@cl.action_callback("complete_task")
-async def _on_complete_task(action: cl.Action):
-    """(MỚI) Xử lý khi bấm nút 'Hoàn thành' công việc."""
-    user_id_str = cl.user_session.get("user_id_str")
-    if not user_id_str:
-        await cl.Message(content="❌ Lỗi: Không tìm thấy user_id_str.").send()
-        return
-
-    # --- SỬA LỖI Ở ĐÂY ---
-    task_id = action.payload.get("task_id")
-    message_id = action.payload.get("message_id") # <-- Lấy ID tin nhắn
-    
-    if not task_id:
-        await cl.Message(content="❌ Lỗi: Không nhận được task_id.").send()
-        return
-
-    try:
-        ok = await asyncio.to_thread(_mark_task_complete_db, task_id, user_id_str)
-        if ok:
-            # Note: Chainlit không hỗ trợ xóa message đã gửi
-            # Chỉ gửi thông báo xác nhận
-            await cl.Message(content=f"✅ Đã hoàn thành công việc!").send()
-        else:
-            await cl.Message(content=f"⚠️ Không thể cập nhật công việc (ID: {task_id}).").send()
-    except Exception as e:
-        await cl.Message(content=f"❌ Lỗi khi hoàn thành công việc: {e}").send()
-    # --- KẾT THÚC SỬA LỖI ---
+# --- Các action callbacks khác (không dùng cho task nữa, task dùng CustomElement) ---
 
 
 
@@ -5918,6 +5897,301 @@ async def setup_chat_session(user: cl.User):
     # (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3213)
     # (THAY THẾ TOÀN BỘ HÀM NÀY - KHOẢNG DÒNG 3213)
     @tool
+    async def tao_cong_viec(
+        title: str,
+        due_date: str,
+        description: str = "",
+        priority: str = "medium",
+        tags: str = ""
+    ) -> str:
+        """
+        ➕ TẠO CÔNG VIỆC MỚI
+        
+        Tạo task mới với đầy đủ thông tin.
+        
+        Args:
+            title: Tiêu đề công việc (bắt buộc)
+            due_date: Thời hạn (format: "2024-12-25 14:00" hoặc "ngày mai 3 giờ chiều")
+            description: Mô tả chi tiết (optional)
+            priority: "high", "medium", hoặc "low" (mặc định: medium)
+            tags: Các tag phân loại, cách nhau bởi dấu phẩy (vd: "urgent, meeting")
+        """
+        import task_manager as tm
+        
+        user_email = cl.user_session.get("user_email")
+        llm = cl.user_session.get("llm_logic")
+        
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
+        if not llm:
+            return "❌ Lỗi: Không tìm thấy llm_logic"
+        
+        try:
+            # 1. Parse due date using LLM (better than dateutil for Vietnamese)
+            due_datetime = await parse_when_to_dt(due_date)
+            
+            # 2. Auto-extract tags from title using LLM (categorize like fact_key)
+            tags_list = []
+            if tags:
+                # User provided tags
+                tags_list = [t.strip() for t in tags.split(',') if t.strip()]
+            else:
+                # Auto-extract using LLM
+                try:
+                    extract_prompt = f"""
+Phân tích tiêu đề công việc sau và xác định DANH MỤC (category) chính của nó.
+Chỉ trả về 1-3 tag ngắn gọn để PHÂN LOẠI công việc, KHÔNG phải từ khóa chi tiết.
+
+Các danh mục gợi ý:
+- Cá nhân (personal): việc cá nhân, sức khỏe, học tập
+- Gia đình (family): con cái, bố mẹ, họ hàng
+- Công việc (work): dự án, họp, báo cáo, deadline
+- Khách hàng (customer): họp khách, gặp đối tác
+- Tài chính (finance): thanh toán, hóa đơn, ngân hàng
+- Mua sắm (shopping): đi chợ, mua đồ
+- Sự kiện (event): sinh nhật, lễ hội, tiệc
+
+Tiêu đề: {title}
+
+Ví dụ:
+- "Họp khách hàng ABC về dự án X" → work, customer
+- "Nộp báo cáo tháng 11" → work
+- "Đi học lúc 10h" → personal
+- "Cho con đi học" → family
+- "Thanh toán tiền điện" → finance
+- "Đi chợ mua rau" → shopping
+
+Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
+                    
+                    llm_response = await llm.ainvoke(extract_prompt)
+                    tags_text = llm_response.content.strip()
+                    tags_list = [t.strip() for t in tags_text.split(',') if t.strip()][:3]  # Max 3 tags
+                    print(f"[Auto-Tags] Extracted from '{title}': {tags_list}")
+                except Exception as e:
+                    print(f"[Auto-Tags] Failed to extract: {e}")
+                    tags_list = []
+            
+            # 3. Create task
+            task_id = await asyncio.to_thread(
+                tm.create_task,
+                user_email=user_email,
+                title=title,
+                description=description or None,
+                due_date=due_datetime,
+                priority=priority.lower(),
+                tags=tags_list,
+                assigned_by=user_email
+            )
+            
+            # 4. Display confirmation
+            await cl.Message(
+                content=f"✅ **Đã tạo công việc #{task_id}**\n\n"
+                       f"📋 **{title}**\n"
+                       f"⏰ Hạn: {due_datetime.strftime('%d/%m/%Y %H:%M')}\n"
+                       f"🎯 Priority: {priority.upper()}\n"
+                       f"🏷️ Tags: {', '.join(tags_list) if tags_list else 'None'}"
+            ).send()
+            
+            return f"✅ Công việc #{task_id} đã được tạo: {title}"
+            
+        except Exception as e:
+            return f"❌ Lỗi khi tạo công việc: {e}"
+    
+    @tool
+    async def danh_dau_hoan_thanh(task_id: int) -> str:
+        """
+        ✅ ĐÁNH DẤU CÔNG VIỆC HOÀN THÀNH
+        
+        Args:
+            task_id: ID của công việc cần đánh dấu hoàn thành
+        """
+        import task_manager as tm
+        
+        user_email = cl.user_session.get("user_email")
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
+        
+        try:
+            success = await asyncio.to_thread(
+                tm.mark_complete,
+                task_id=task_id,
+                user_email=user_email
+            )
+            
+            if success:
+                await cl.Message(content=f"✅ Đã hoàn thành công việc #{task_id}").send()
+                return f"✅ Task #{task_id} đã được đánh dấu hoàn thành"
+            else:
+                return f"❌ Không tìm thấy task #{task_id} hoặc bạn không có quyền"
+                
+        except Exception as e:
+            return f"❌ Lỗi: {e}"
+    
+    @tool
+    async def xoa_cong_viec(task_id: int) -> str:
+        """
+        🗑️ XÓA CÔNG VIỆC
+        
+        Args:
+            task_id: ID của công việc cần xóa
+        """
+        import task_manager as tm
+        
+        user_email = cl.user_session.get("user_email")
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
+        
+        try:
+            success = await asyncio.to_thread(
+                tm.delete_task,
+                task_id=task_id,
+                user_email=user_email
+            )
+            
+            if success:
+                await cl.Message(content=f"🗑️ Đã xóa công việc #{task_id}").send()
+                return f"✅ Task #{task_id} đã được xóa"
+            else:
+                return f"❌ Không tìm thấy task #{task_id} hoặc bạn không có quyền"
+                
+        except Exception as e:
+            return f"❌ Lỗi: {e}"
+    
+    @tool
+    async def sua_cong_viec(
+        task_id: int,
+        title: str = None,
+        description: str = None,
+        due_date: str = None,
+        priority: str = None,
+        tags: str = None
+    ) -> str:
+        """
+        ✏️ SỬA CÔNG VIỆC
+        
+        Cập nhật thông tin công việc. Chỉ cần truyền các field muốn thay đổi.
+        
+        Args:
+            task_id: ID của công việc cần sửa (bắt buộc)
+            title: Tiêu đề mới (optional)
+            description: Mô tả mới (optional)
+            due_date: Thời hạn mới (format: "2024-12-25 14:00" hoặc "ngày mai 3 giờ chiều")
+            priority: "high", "medium", hoặc "low" (optional)
+            tags: Các tag mới, cách nhau bởi dấu phẩy (optional)
+        """
+        import task_manager as tm
+        
+        user_email = cl.user_session.get("user_email")
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
+        
+        try:
+            # Parse due date if provided
+            due_datetime = None
+            if due_date:
+                from dateutil import parser as date_parser
+                try:
+                    due_datetime = date_parser.parse(due_date, fuzzy=True)
+                except:
+                    due_datetime = await parse_when_to_dt(due_date)
+            
+            # Parse tags if provided
+            tags_list = None
+            if tags:
+                tags_list = [t.strip() for t in tags.split(',') if t.strip()]
+            
+            # Update task
+            success = await asyncio.to_thread(
+                tm.update_task,
+                task_id=task_id,
+                title=title,
+                description=description,
+                due_date=due_datetime,
+                priority=priority.lower() if priority else None,
+                tags=tags_list
+            )
+            
+            if success:
+                update_msg = f"✅ **Đã cập nhật công việc #{task_id}**\n\n"
+                if title: update_msg += f"📝 Tiêu đề: {title}\n"
+                if description: update_msg += f"📄 Mô tả: {description}\n"
+                if due_datetime: update_msg += f"⏰ Hạn: {due_datetime.strftime('%d/%m/%Y %H:%M')}\n"
+                if priority: update_msg += f"🎯 Priority: {priority.upper()}\n"
+                if tags_list: update_msg += f"🏷️ Tags: {', '.join(tags_list)}\n"
+                
+                await cl.Message(content=update_msg).send()
+                return f"✅ Task #{task_id} đã được cập nhật"
+            else:
+                return f"❌ Không tìm thấy task #{task_id} hoặc không có gì thay đổi"
+                
+        except Exception as e:
+            return f"❌ Lỗi khi sửa công việc: {e}"
+    
+    @tool
+    async def xem_danh_sach_cong_viec(filter_status: str = "uncompleted") -> str:
+        """
+        📋 XEM DANH SÁCH CÔNG VIỆC
+        Hiển thị tasks dưới dạng bảng tương tác với UI element.
+        
+        filter_status: "uncompleted" (mặc định), "completed", hoặc "all"
+        """
+        import task_manager as tm
+        
+        user_email = cl.user_session.get("user_email")
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
+        
+        try:
+            # Get tasks
+            tasks = await asyncio.to_thread(
+                tm.get_tasks,
+                user_email=user_email,
+                status=filter_status
+            )
+            
+            # Get stats
+            stats = await asyncio.to_thread(tm.get_task_stats, user_email)
+            
+            if not tasks:
+                return f"📭 Không có công việc nào ({filter_status})"
+            
+            # Prepare data for CustomElement
+            tasks_data = []
+            for task in tasks:
+                tasks_data.append({
+                    "id": task['id'],
+                    "title": task['title'],
+                    "description": task.get('description', ''),
+                    "due_date": task.get('due_date', ''),
+                    "priority": task.get('priority', 'medium'),
+                    "tags": task.get('tags', []),
+                    "is_completed": task.get('is_completed', False),
+                    "recurrence_rule": task.get('recurrence_rule', ''),
+                    "assigned_to": task.get('assigned_to', ''),
+                    "user_email": user_email  # For API calls
+                })
+            
+            # Send CustomElement
+            await cl.Message(
+                content=f"📋 **Tìm thấy {len(tasks)} công việc ({filter_status})**",
+                elements=[
+                    cl.CustomElement(
+                        name="TaskGrid",
+                        props={
+                            "title": f"📋 Danh sách công việc ({filter_status})",
+                            "tasks": tasks_data,
+                            "stats": stats
+                        }
+                    )
+                ]
+            ).send()
+            
+            return f"✅ Đã hiển thị {len(tasks)} công việc trong grid tương tác"
+            
+        except Exception as e:
+            return f"❌ Lỗi: {e}"
+    
+    @tool
     async def hoi_thong_tin(cau_hoi: str):
         """
         📚 HỎI THÔNG TIN - TÌM KIẾM theo NỘI DUNG/CHỦ ĐỀ/DANH MỤC (RAG).
@@ -7465,52 +7739,52 @@ Chỉ trả về 1 số, không giải thích."""
             return f"❌ Lỗi khi tạo công việc: {e}"
         
         
-    @tool("xem_viec_chua_hoan_thanh")
-    async def xem_viec_chua_hoan_thanh() -> str:
-        """
-        Hiển thị tất cả các CÔNG VIỆC (tasks)
-        CHƯA hoàn thành trong UI.
-        """
-        try: 
-            await ui_show_uncompleted_tasks() # <-- Sửa tên hàm
-        except Exception as e: 
-            return f"❌ Lỗi khi hiển thị danh sách công việc: {e}"
-        return "✅ Đã liệt kê các công việc chưa hoàn thành."
-    @tool("xem_viec_da_hoan_thanh")
-    async def xem_viec_da_hoan_thanh() -> str:
-        """
-        Hiển thị tất cả các CÔNG VIỆC (tasks)
-        ĐÃ hoàn thành trong UI.
-        """
-        try: 
-            await ui_show_completed_tasks() # <-- Gọi hàm mới
-        except Exception as e: 
-            return f"❌ Lỗi khi hiển thị danh sách công việc đã hoàn thành: {e}"
-        return "✅ Đã liệt kê các công việc đã hoàn thành."
+    # OLD TOOLS - DISABLED (replaced by xem_danh_sach_cong_viec)
+    # @tool("xem_viec_chua_hoan_thanh")
+    # async def xem_viec_chua_hoan_thanh() -> str:
+    #     """Hiển thị tất cả các CÔNG VIỆC (tasks) CHƯA hoàn thành trong UI."""
+    #     try: 
+    #         await ui_show_uncompleted_tasks()
+    #     except Exception as e: 
+    #         return f"❌ Lỗi khi hiển thị danh sách công việc: {e}"
+    #     return "✅ Đã liệt kê các công việc chưa hoàn thành."
+    
+    # @tool("xem_viec_da_hoan_thanh")
+    # async def xem_viec_da_hoan_thanh() -> str:
+    #     """Hiển thị tất cả các CÔNG VIỆC (tasks) ĐÃ hoàn thành trong UI."""
+    #     try: 
+    #         await ui_show_completed_tasks()
+    #     except Exception as e: 
+    #         return f"❌ Lỗi khi hiển thị danh sách công việc đã hoàn thành: {e}"
+    #     return "✅ Đã liệt kê các công việc đã hoàn thành."
     # (Tool xem_danh_sach_user của bạn bắt đầu từ đây...)
     
     # (DÁN TOOL MỚI NÀY VÀO KHOẢNG DÒNG 4650)
     @tool("tim_cong_viec_theo_ngay", args_schema=TimCongViecSchema)
     async def tim_cong_viec_theo_ngay(thoi_gian: str) -> str:
         """
-        (MỚI) Tìm và hiển thị các công việc (tasks) CHƯA HOÀN THÀNH
+        Tìm và hiển thị các công việc (tasks) CHƯA HOÀN THÀNH
         dựa trên một khoảng thời gian (ví dụ: 'ngày mai', 'hôm nay').
         """
+        import task_manager as tm
+        
         llm = cl.user_session.get("llm_logic")
+        user_email = cl.user_session.get("user_email")
+        
         if not llm:
             return "❌ Lỗi: Không tìm thấy llm_logic."
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
             
         try:
-            # 1. Dùng LLM để lấy ngày
-            # (Chúng ta dùng _llm_parse_dt, nó rất giỏi việc này)
+            # Parse date from natural language
             dt_target = await _llm_parse_dt(llm, thoi_gian)
             
-            # 2. Xác định khoảng (bắt đầu, kết thúc)
-            # (Mặc định là lọc trong 1 ngày)
+            # Default: filter by day
             start_dt = _get_start_of_day(dt_target)
             end_dt = _get_end_of_day(dt_target)
             
-            # (Sửa logic cho "tuần này" hoặc "tháng này" nếu LLM hiểu)
+            # Special cases
             low_q = thoi_gian.lower()
             now = datetime.now(VN_TZ)
             
@@ -7522,47 +7796,81 @@ Chỉ trả về 1 số, không giải thích."""
                 last_day_num = calendar.monthrange(now.year, now.month)[1]
                 end_dt = _get_end_of_day(now.replace(day=last_day_num))
             
-            # 3. Gọi hàm UI (đã được nâng cấp)
-            await ui_show_uncompleted_tasks(
+            # Get tasks
+            tasks = await asyncio.to_thread(
+                tm.get_tasks,
+                user_email=user_email,
+                status="uncompleted",
                 start_date=start_dt,
-                end_date=end_dt,
-                filter_title=thoi_gian
+                end_date=end_dt
             )
             
-            return f"✅ Đã hiển thị các công việc từ {_fmt_dt(start_dt)} đến {_fmt_dt(end_dt)}."
+            if not tasks:
+                return f"📭 Không có công việc nào trong khoảng {_fmt_dt(start_dt)} - {_fmt_dt(end_dt)}"
+            
+            # Build markdown table
+            md_content = f"📋 **Công việc {thoi_gian}** ({len(tasks)} tasks)\n\n"
+            md_content += f"📅 Từ {_fmt_dt(start_dt)} đến {_fmt_dt(end_dt)}\n\n"
+            
+            md_content += "| ID | Tiêu đề | Hạn | Priority |\n"
+            md_content += "|---|---|---|---|\n"
+            
+            for task in tasks[:20]:
+                priority = task.get('priority', 'medium').upper()
+                md_content += f"| {task['id']} | {task['title']} | {task.get('due_date', 'N/A')} | {priority} |\n"
+            
+            await cl.Message(content=md_content).send()
+            
+            return f"✅ Đã hiển thị {len(tasks)} công việc"
 
         except Exception as e:
             import traceback; traceback.print_exc()
             return f"❌ Lỗi khi tìm công việc: {e}"
-    # (DÁN TOOL MỚI NÀY VÀO KHOẢNG DÒNG 4650)
     @tool("tim_cong_viec_qua_han")
     async def tim_cong_viec_qua_han() -> str:
         """
-        (MỚI) Tìm và hiển thị các công việc (tasks) CHƯA HOÀN THÀNH
+        Tìm và hiển thị các công việc (tasks) CHƯA HOÀN THÀNH
         có ngày HẠN CHÓT (Due Date) ĐÃ QUA (quá hạn).
         """
-        now_vn = datetime.now(VN_TZ)
+        import task_manager as tm
         
-        # Lấy ngày hôm nay (00:00:00) làm mốc so sánh
-        today_start = _get_start_of_day(now_vn)
+        user_email = cl.user_session.get("user_email")
+        if not user_email:
+            return "❌ Lỗi: Không tìm thấy user_email"
+        
+        now_vn = datetime.now(VN_TZ)
+        yesterday_end = _get_end_of_day(now_vn - timedelta(days=1))
         
         try:
-            # Gọi hàm UI (đã được nâng cấp) với bộ lọc:
-            # - start_date = None (không cần)
-            # - end_date = 'Hết ngày hôm qua' (Tất cả việc đến trước hôm nay)
-            yesterday_end = _get_end_of_day(now_vn - timedelta(days=1))
-            
-            await ui_show_uncompleted_tasks(
-                start_date=None, # Bỏ qua Start Date
-                end_date=yesterday_end, # Lọc tất cả task có Due Date đến hết ngày hôm qua
-                filter_title="Quá Hạn"
+            # Get overdue tasks
+            tasks = await asyncio.to_thread(
+                tm.get_tasks,
+                user_email=user_email,
+                status="uncompleted",
+                end_date=yesterday_end
             )
             
-            return "✅ Đã hiển thị các công việc Quá Hạn (có hạn chót đến hết ngày hôm qua)."
-
+            if not tasks:
+                return "✅ Không có công việc quá hạn"
+            
+            # Build markdown table
+            md_content = f"⚠️ **Công việc quá hạn** ({len(tasks)} tasks)\n\n"
+            
+            md_content += "| ID | Tiêu đề | Hạn | Priority |\n"
+            md_content += "|---|---|---|---|\n"
+            
+            for task in tasks[:20]:
+                priority = task.get('priority', 'medium').upper()
+                md_content += f"| {task['id']} | {task['title']} | {task.get('due_date', 'N/A')} | {priority} |\n"
+            
+            await cl.Message(content=md_content).send()
+            
+            return f"✅ Đã hiển thị {len(tasks)} công việc quá hạn"
+            
         except Exception as e:
             import traceback; traceback.print_exc()
-            return f"❌ Lỗi khi tìm công việc Quá Hạn: {e}"
+            return f"❌ Lỗi: {e}"
+    
     @tool
     async def xem_danh_sach_user(xem: str = "xem"):
         """
@@ -7638,6 +7946,10 @@ Chỉ trả về 1 số, không giải thích."""
             "rule": "(XÓA CÔNG VIỆC) Nếu 'input' yêu cầu 'xóa công việc', 'hủy task', 'bỏ việc' -> Dùng `xoa_cong_viec`.",
             "tool": xoa_cong_viec
         },
+        "sua_cong_viec": {
+            "rule": "(SỬA CÔNG VIỆC) Nếu 'input' yêu cầu 'sửa công việc', 'cập nhật task', 'thay đổi task', 'edit task' -> Dùng `sua_cong_viec`.",
+            "tool": sua_cong_viec
+        },
         "xoa_ghi_chu": {
             "rule": "(XÓA GHI CHÚ) Nếu 'input' yêu cầu 'xóa ghi chú', 'xóa note' (VÀ KHÔNG PHẢI 'xóa file') -> Dùng `xoa_ghi_chu`.",
             "tool": xoa_ghi_chu
@@ -7663,6 +7975,14 @@ Chỉ trả về 1 số, không giải thích."""
                     "   - (Cho Nhắc nhở) Nếu user nói 'nhắc lại' -> đặt `escalate=True`.",
             "tool": dat_lich_nhac_nho
         },
+        "tao_cong_viec": {
+            "rule": "(TẠO TASK MỚI - ƯU TIÊN 2) Nếu 'input' yêu cầu 'tạo công việc', 'thêm task', 'tạo task mới' -> Dùng `tao_cong_viec`.",
+            "tool": tao_cong_viec
+        },
+        "danh_dau_hoan_thanh": {
+            "rule": "(HOÀN THÀNH TASK) Nếu 'input' yêu cầu 'đánh dấu hoàn thành', 'hoàn thành công việc', 'xong task' -> Dùng `danh_dau_hoan_thanh`.",
+            "tool": danh_dau_hoan_thanh
+        },
         # (Sửa lỗi V95)
         "hoi_thong_tin": {
             "rule": "(HỎI/LỌC - ƯU TIÊN 1) Dùng cho TẤT CẢ các câu HỎI, TÌM KIẾM CÓ LỌC."
@@ -7678,13 +7998,9 @@ Chỉ trả về 1 số, không giải thích."""
             "rule": "(LỌC TASK - ƯU TIÊN 1B) Nếu 'input' yêu cầu 'xem công việc', 'xem task' VÀ CÓ LỌC THỜI GIAN (ví dụ: 'ngày mai', 'hôm nay', 'tuần này') -> Dùng `tim_cong_viec_theo_ngay`.",
             "tool": tim_cong_viec_theo_ngay
         },
-        "xem_viec_chua_hoan_thanh": {
-            "rule": "(XEM TẤT CẢ TASK - ƯU TIÊN 2) Nếu 'input' chỉ yêu cầu 'xem công việc', 'xem checklist' (VÀ KHÔNG CÓ LỌC THỜI GIAN) -> Dùng `xem_viec_chua_hoan_thanh`.",
-            "tool": xem_viec_chua_hoan_thanh
-        },
-        "xem_viec_da_hoan_thanh": {
-            "rule": "(XEM TASK ĐÃ XONG - ƯU TIÊN 2) Nếu 'input' yêu cầu 'xem việc ĐÃ HOÀN THÀNH', 'xem việc đã xong' -> Dùng `xem_viec_da_hoan_thanh`.",
-            "tool": xem_viec_da_hoan_thanh
+        "xem_danh_sach_cong_viec": {
+            "rule": "(XEM TẤT CẢ TASK - ƯU TIÊN 1) Nếu 'input' yêu cầu 'xem công việc', 'xem task', 'danh sách công việc' -> Dùng `xem_danh_sach_cong_viec`.",
+            "tool": xem_danh_sach_cong_viec
         },
         "xem_lich_nhac": {
             "rule": "(XEM LỊCH NHẮC - ƯU TIÊN 2) Nếu 'input' yêu cầu 'xem lịch nhắc', 'xem nhắc nhở' (phân biệt rõ với 'công việc') -> Dùng `xem_lich_nhac`.",
@@ -7769,8 +8085,7 @@ Chỉ trả về 1 số, không giải thích."""
             "hoi_thong_tin": base_tools_data["hoi_thong_tin"],
             "tim_cong_viec_qua_han": base_tools_data["tim_cong_viec_qua_han"],
             "tim_cong_viec_theo_ngay": base_tools_data["tim_cong_viec_theo_ngay"],
-            "xem_viec_chua_hoan_thanh": base_tools_data["xem_viec_chua_hoan_thanh"],
-            "xem_viec_da_hoan_thanh": base_tools_data["xem_viec_da_hoan_thanh"],
+            "xem_danh_sach_cong_viec": base_tools_data["xem_danh_sach_cong_viec"],
             "xem_lich_nhac": base_tools_data["xem_lich_nhac"],
             "xem_bo_nho": base_tools_data["xem_bo_nho"],
             "tim_kiem_file": base_tools_data["tim_kiem_file"],
@@ -7781,12 +8096,15 @@ Chỉ trả về 1 số, không giải thích."""
         "luu_thong_tin": base_tools_data["luu_thong_tin"],
         "dat_lich_cong_viec": base_tools_data["dat_lich_cong_viec"],
         "dat_lich_nhac_nho": base_tools_data["dat_lich_nhac_nho"],
+        "tao_cong_viec": base_tools_data["tao_cong_viec"],
     }
     
     delete_tools_data = {
         "xoa_file_da_luu": base_tools_data["xoa_file_da_luu"],
         "xoa_cong_viec": base_tools_data["xoa_cong_viec"],
         "xoa_ghi_chu": base_tools_data["xoa_ghi_chu"],
+        "danh_dau_hoan_thanh": base_tools_data["danh_dau_hoan_thanh"],
+        "sua_cong_viec": base_tools_data["sua_cong_viec"],
         "xoa_nhac_nho": base_tools_data["xoa_nhac_nho"],
     }
     
