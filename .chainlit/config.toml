@@ -6,10 +6,12 @@ enable_telemetry = true
 user_env = []
 
 # Duration (in seconds) during which the session is saved when the connection is lost
-session_timeout = 3600
+# 30 days = 2592000 seconds
+session_timeout = 2592000
 
 # Duration (in seconds) of the user session expiry
-user_session_timeout = 1296000  # 15 days
+# 30 days = 2592000 seconds
+user_session_timeout = 2592000
 
 # Enable third parties caching (e.g LangChain cache)
 cache = false
@@ -18,10 +20,8 @@ cache = false
 allow_origins = ["*"]
 
 # 🔥 DATA PERSISTENCE - CHAT HISTORY 🔥
-# TẠM TẮT vì BaseDataLayer API phức tạp trong Chainlit 2.3.0
-# database = "local"
-# data_persistence = true
-data_persistence = false
+# Enable persistent chat history per user
+data_persistence = false  # Keep false, we use custom implementation
 
 [features]
 # Process and display HTML in messages. This can be a security risk (see https://stackoverflow.com/questions/19603097/why-is-it-dangerous-to-render-user-generated-html-or-javascript)

@@ -761,6 +761,10 @@ async def on_chat_resume(thread: dict):
     print(f"🔄 [Chat Resume] Mode: {chat_profile}")
     
     # 4. Lấy quyền admin và tên user
+    user_email = user.identifier.lower()
+    cl.user_session.set("user_email", user_email)
+    cl.user_session.set("user_id_str", user_email)
+    
     try:
         user_db_data = await asyncio.to_thread(get_user_by_email, user.identifier)
         is_admin = (user_db_data and user_db_data.get('is_admin') == 1)
@@ -768,6 +772,17 @@ async def on_chat_resume(thread: dict):
         
         cl.user_session.set("is_admin", is_admin)
         cl.user_session.set("user_name", user_name)
+        
+        # 🚀 Load persistent session
+        session_id = f"persistent_{user_email.replace('@', '_at_').replace('.', '_')}"
+        chat_history = load_chat_history(user_email, session_id)
+        cl.user_session.set("session_id", session_id)
+        cl.user_session.set("chat_history", chat_history)
+        
+        if chat_history:
+            print(f"✅ [Chat Resume] Loaded {len(chat_history)} messages from persistent session")
+        else:
+            print(f"✅ [Chat Resume] New persistent session created")
         print(f"👤 [Chat Resume] User: {user.identifier}, Admin: {is_admin}, Name: {user_name}")
     except Exception as e:
         print(f"❌ [Chat Resume] Lỗi khi lấy user data: {e}")
@@ -6185,15 +6200,20 @@ async def setup_chat_session(user: cl.User):
         display_name = f"**{user_id_str}**"
     # --- 🚀 KẾT THÚC CẬP NHẬT LỜI CHÀO 🚀 ---
 
-    # --- 1. Khởi tạo Session ID và Lịch sử Chat ---
-    session_id = f"session_{_timestamp()}"
-    session_id = f"session_{_timestamp()}" # Tạo ID session mới
-    chat_history = []                     # Bắt đầu lịch sử mới
+    # --- 1. Khởi tạo Session ID và Lịch sử Chat (PERSISTENT) ---
+    # 🚀 SỬA: Dùng user_email làm session_id để persistent (1 user = 1 thread)
+    session_id = f"persistent_{user_id_str.replace('@', '_at_').replace('.', '_')}"  # e.g., persistent_onsm_at_oshima_vn
+    
+    # Load chat history từ file (nếu có)
+    chat_history = load_chat_history(user_id_str, session_id)
     
     cl.user_session.set("session_id", session_id)
     cl.user_session.set("chat_history", chat_history)
     
-    print(f"✅ [Session] Đã tạo session_id mới: {session_id}")
+    if chat_history:
+        print(f"✅ [Session] Đã load {len(chat_history)} tin nhắn từ session: {session_id}")
+    else:
+        print(f"✅ [Session] Tạo session mới: {session_id}")
     # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
 
     # --- 4. Hiển thị danh sách hội thoại CỦA USER ---
