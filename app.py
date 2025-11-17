@@ -17,17 +17,16 @@ import docx # từ python-docx
 import pypdf
 import unidecode
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma  # Keep for backward compatibility
-from langchain_postgres import PGVector
-from langchain_postgres.vectorstores import PGVector as PGVectorStore
+# from langchain_chroma import Chroma  # Removed - using PostgreSQL pgvector only
+from langchain_postgres.vectorstores import PGVector
 from langchain_openai import OpenAIEmbeddings
 # from langchain_huggingface import HuggingFaceEmbeddings  # ⚠️ DISABLED: PyTorch conflict
 from langchain_core.prompts import PromptTemplate
-from postgres_utils import get_postgres_connection_string, init_connection_pool, test_connection, init_pgvector_extension
+from postgres_utils import get_postgres_connection_string, init_connection_pool, test_connection
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 from bs4 import BeautifulSoup
-from chromadb.config import Settings
+# from chromadb.config import Settings  # Removed - using PostgreSQL only
 import contextvars
 from datetime import datetime, timedelta # <-- SỬA: Thêm timedelta
 from typing import List, Tuple, Optional, Union
@@ -49,6 +48,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler  # pip install apsch
 from apscheduler.triggers.date import DateTrigger
 import pytz  # pip install pytz
 import asyncio
+import firebase_admin
+from firebase_admin import credentials, messaging
 from asyncio import Queue
 from apscheduler.triggers.date import DateTrigger
 import calendar
@@ -66,7 +67,38 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 GLOBAL_MESSAGE_QUEUE: Optional[Queue] = None   # "Tổng đài" (chỉ 1)
 ACTIVE_SESSION_QUEUES = {}                     # (SỬA) { user_id_str: [queue1, queue2] }
 POLLER_STARTED = False                         # Cờ để khởi động Tổng đài (1 lần)
-NOTIFICATION_POLLER_STARTED = False            # Cờ để khởi động Task Notification Poller (1 lần)                      # Cờ để khởi động Tổng đài (1 lần)
+NOTIFICATION_POLLER_STARTED = False            # Cờ để khởi động Task Notification Poller (1 lần)
+PENDING_BROADCASTS = []  # Lưu tin nhắn tổng đài khi chưa có event loop/broadcaster
+
+# ✅ FIX: Khởi tạo GLOBAL_MESSAGE_QUEUE ngay khi module load
+# Đảm bảo scheduler jobs có thể access queue khi chạy
+_MAIN_EVENT_LOOP = None  # Store main event loop for scheduler thread access
+
+def _init_global_queue():
+    """Khởi tạo GLOBAL_MESSAGE_QUEUE và broadcaster poller ngay khi app start"""
+    global GLOBAL_MESSAGE_QUEUE, POLLER_STARTED, _MAIN_EVENT_LOOP
+    if GLOBAL_MESSAGE_QUEUE is None:
+        try:
+            # Lấy event loop hiện tại hoặc tạo mới nếu chưa có
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Store loop globally for scheduler threads
+            _MAIN_EVENT_LOOP = loop
+            
+            GLOBAL_MESSAGE_QUEUE = asyncio.Queue()
+            print("✅ [Global Init] GLOBAL_MESSAGE_QUEUE đã được khởi tạo")
+            
+            # Khởi động broadcaster poller
+            if not POLLER_STARTED:
+                asyncio.create_task(global_broadcaster_poller())
+                POLLER_STARTED = True
+                print("✅ [Global Init] Global Broadcaster Poller đã khởi động")
+        except Exception as e:
+            print(f"❌ [Global Init] Lỗi khởi tạo GLOBAL_MESSAGE_QUEUE: {e}")                      # Cờ để khởi động Tổng đài (1 lần)
 # =========================================================
 # 📦 Env
 # =========================================================
@@ -90,12 +122,8 @@ PUSH_VERIFY_TLS = os.getenv("PUSH_VERIFY_TLS", "true").strip().lower() not in ("
 print(f"[PUSH] url={PUSH_API_URL} verify_tls={PUSH_VERIFY_TLS} token_head={PUSH_API_TOKEN[:6]}***")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# --- SỬA LỖI & CẤU TRÚC LẠI ĐƯỜNG DẪN ---
-# 1. Thư mục toàn cục cho Scheduler (không đổi)
-GLOBAL_MEMORY_DIR = os.path.join(BASE_DIR, "memory_db")
-JOBSTORE_DB_FILE = os.path.join(GLOBAL_MEMORY_DIR, "jobs.sqlite")
-os.makedirs(GLOBAL_MEMORY_DIR, exist_ok=True)
-SEARCH_API_URL = "https://ocrm.oshima.vn/api/method/searchlistproductnew" # <-- 🚀 THÊM DÒNG NÀY (Nhớ thay URL nếu cần)
+# --- CẤU TRÚC ĐƯỜNG DẪN ---
+SEARCH_API_URL = "https://ocrm.oshima.vn/api/method/searchlistproductnew"
 GETUSER_API_URL = os.getenv("GETUSER_API_URL", "https://ocrm.oshima.vn/api/method/getuserocrm")
 CHART_API_URL = "https://ocrm.oshima.vn/api/method/salesperson" # <-- Khai báo thẳng URL ở đây
 CHANGEPASS_API_URL="https://ocrm.oshima.vn/api/method/changepassword"
@@ -148,19 +176,19 @@ _PGVECTOR_TABLE_NAME = "langchain_pg_embedding"
 # Global Scheduler (khởi tạo 1 lần)
 SCHEDULER: Optional[AsyncIOScheduler] = None
 
+# Import scheduler jobs từ module riêng (tránh lỗi Windows path trong APScheduler)
+# Inject callbacks để tránh circular import
+import scheduler_jobs
+from scheduler_jobs import _do_push, _sync_users_from_api_sync, _first_fire_escalation_job, _push_task_notification, _tick_job_sync
+
 # Cấu hình nơi lưu trữ job (database) - MIGRATED TO PostgreSQL
-try:
-    from postgres_utils import get_postgres_connection_string as pg_conn_str
-    jobstores = {
-        'default': SQLAlchemyJobStore(url=pg_conn_str())
-    }
-    print("✅ [APScheduler] Sử dụng PostgreSQL jobstore")
-except Exception as e:
-    print(f"⚠️ [APScheduler] Lỗi kết nối PostgreSQL: {e}. Fallback sang SQLite...")
-    jobstores = {
-        'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBSTORE_DB_FILE}')
-    }
-    print(f"✅ [APScheduler] Sử dụng SQLite jobstore tại {JOBSTORE_DB_FILE}")
+from postgres_utils import get_postgres_connection_string
+from apscheduler.jobstores.memory import MemoryJobStore
+jobstores = {
+    'default': SQLAlchemyJobStore(url=get_postgres_connection_string()),
+    'memory': MemoryJobStore()  # Cho các job không cần persist (sync_users_job)
+}
+print("✅ [APScheduler] Sử dụng PostgreSQL jobstore")
 
 # Theo dõi các “escalating reminders” đang chạy theo từng session
 ACTIVE_ESCALATIONS = {}  # { internal_session_id: { "repeat_job_id": str, "acked": bool } }
@@ -223,7 +251,124 @@ _CLASSIFY_CACHE = {}  # { "query_hash": (fact_key, fact_label, core_query) }
 _CLASSIFY_CACHE_TIMEOUT = 300  # 5 phút
 
 
-def _get_cached_file_list(vectorstore: Chroma, user_email: str) -> list:
+def _vectorstore_query(vectorstore: Any, query_embeddings: list, n_results: int, where: dict = None, where_document: dict = None, include: list = None):
+    """
+    Universal vectorstore query wrapper - works with both ChromaDB and PGVector
+    """
+    try:
+        # Try ChromaDB API first (if _collection exists)
+        if hasattr(vectorstore, '_collection'):
+            return _vectorstore_query(vectorstore, 
+                query_embeddings=query_embeddings,
+                n_results=n_results,
+                where=where,
+                where_document=where_document,
+                include=include or ["documents", "metadatas"]
+            )
+        else:
+            # PGVector API - use similarity search
+            from langchain_postgres.vectorstores import PGVector
+            if isinstance(vectorstore, PGVector):
+                # Convert query_embeddings to single vector
+                query_vector = query_embeddings[0] if isinstance(query_embeddings, list) else query_embeddings
+                
+                # PGVector doesn't support where/where_document in the same way
+                # Use similarity_search_with_score_by_vector
+                results_with_scores = vectorstore.similarity_search_with_score_by_vector(
+                    embedding=query_vector,
+                    k=n_results,
+                    filter=where  # PGVector uses 'filter' instead of 'where'
+                )
+                
+                # Convert to ChromaDB-like format
+                ids = []
+                documents = []
+                metadatas = []
+                distances = []
+                
+                for doc, score in results_with_scores:
+                    # Generate ID from metadata if available
+                    doc_id = doc.metadata.get('id', doc.metadata.get('chroma_id', str(hash(doc.page_content))))
+                    ids.append(doc_id)
+                    documents.append(doc.page_content)
+                    metadatas.append(doc.metadata)
+                    distances.append(score)
+                
+                return {
+                    "ids": [ids],
+                    "documents": [documents],
+                    "metadatas": [metadatas],
+                    "distances": [distances]
+                }
+            else:
+                raise ValueError(f"Unsupported vectorstore type: {type(vectorstore)}")
+    except Exception as e:
+        print(f"❌ [VectorStore Query] Error: {e}")
+        raise
+
+
+def _vectorstore_get(vectorstore: Any, where: dict = None, where_document: dict = None, include: list = None, ids: list = None):
+    """
+    Universal vectorstore get wrapper - works with both ChromaDB and PGVector
+    """
+    try:
+        if hasattr(vectorstore, '_collection'):
+            return _vectorstore_get(vectorstore, 
+                where=where,
+                where_document=where_document,
+                include=include or ["documents", "metadatas"],
+                ids=ids
+            )
+        else:
+            from langchain_postgres.vectorstores import PGVector
+            if isinstance(vectorstore, PGVector):
+                # PGVector doesn't have direct get() - use similarity_search with large k
+                if ids:
+                    # Get specific IDs
+                    docs = vectorstore.similarity_search("", k=10000, filter={"id": {"$in": ids}} if where else where)
+                else:
+                    docs = vectorstore.similarity_search("", k=10000, filter=where)
+                
+                result_ids = []
+                result_docs = []
+                result_metas = []
+                
+                for doc in docs:
+                    result_ids.append(doc.metadata.get("id", doc.metadata.get("chroma_id", "")))
+                    result_docs.append(doc.page_content)
+                    result_metas.append(doc.metadata)
+                
+                return {
+                    "ids": result_ids,
+                    "documents": result_docs,
+                    "metadatas": result_metas
+                }
+            else:
+                raise ValueError(f"Unsupported vectorstore type: {type(vectorstore)}")
+    except Exception as e:
+        print(f"❌ [VectorStore Get] Error: {e}")
+        raise
+
+
+def _vectorstore_delete(vectorstore: Any, ids: list):
+    """
+    Universal vectorstore delete wrapper - works with both ChromaDB and PGVector
+    """
+    try:
+        if hasattr(vectorstore, '_collection'):
+            _vectorstore_delete(vectorstore, ids=ids)
+        else:
+            from langchain_postgres.vectorstores import PGVector
+            if isinstance(vectorstore, PGVector):
+                vectorstore.delete(ids=ids)
+            else:
+                raise ValueError(f"Unsupported vectorstore type: {type(vectorstore)}")
+    except Exception as e:
+        print(f"❌ [VectorStore Delete] Error: {e}")
+        raise
+
+
+def _get_cached_file_list(vectorstore: Any, user_email: str) -> list:
     """
     (MỚI - OPTIMIZATION)
     Lấy danh sách file với cache 5 giây để tránh query Chroma liên tục.
@@ -440,31 +585,39 @@ async def on_start_after_login():
     user_email = user_email.lower()  # Chuẩn hóa email (lowercase)
 
     cl.user_session.set("user_email", user_email)  # Lưu email vào session
+    cl.user_session.set("user_id_str", user_email)  # Cũng lưu vào user_id_str cho consistency
     print(f"✅ [on_chat_start] User email: {user_email}")
+    # --- V108: Capture event loop & đảm bảo Broadcaster chạy nếu queue đã lazy init trước khi login ---
+    try:
+        global _MAIN_EVENT_LOOP, GLOBAL_MESSAGE_QUEUE, POLLER_STARTED, PENDING_BROADCASTS
+        _MAIN_EVENT_LOOP = asyncio.get_running_loop()
+        # Nếu queue đã được lazy init bởi scheduler job (chưa có poller) thì khởi động poller ngay
+        if GLOBAL_MESSAGE_QUEUE and not POLLER_STARTED:
+            asyncio.create_task(global_broadcaster_poller())
+            POLLER_STARTED = True
+            print("✅ [Global] Broadcaster Poller khởi động sau lazy init (post-login).")
+    except Exception as e:
+        print(f"⚠️ [Global] Không thể capture event loop ban đầu: {e}")
     
-    # --- KHỞI TẠO SHARED VECTORSTORE (MIGRATED TO PostgreSQL + pgvector) ---
+    # --- KHỞI TẠO SHARED VECTORSTORE (PostgreSQL with pgvector extension) ---
     global _SHARED_VECTORSTORE_CL
     
     if _SHARED_VECTORSTORE_CL is None:
         print("[Shared DB] Đang khởi tạo Shared VectorStore lần đầu...")
         try:
-            # Try PGVector first
+            # PostgreSQL VectorStore với pgvector extension (hiệu suất tối ưu)
             connection_string = get_postgres_connection_string()
-            _SHARED_VECTORSTORE_CL = PGVectorStore(
+            _SHARED_VECTORSTORE_CL = PGVector(
                 connection=connection_string,
                 embeddings=embeddings,
                 collection_name=_PGVECTOR_COLLECTION_NAME,
                 use_jsonb=True,
+                pre_delete_collection=False,  # Giữ collection cũ
             )
-            print(f"✅ [PGVector] Shared VectorStore đã khởi tạo (PostgreSQL)")
+            print(f"✅ [PostgreSQL] Shared VectorStore đã khởi tạo (pgvector extension enabled)")
         except Exception as e:
-            print(f"⚠️ [PGVector] Lỗi: {e}. Fallback sang ChromaDB...")
-            _SHARED_VECTORSTORE_CL = Chroma(
-                persist_directory=SHARED_VECTOR_DB_DIR,
-                embedding_function=embeddings,
-                collection_name="shared_memory"
-            )
-            print(f"✅ [ChromaDB] Shared VectorStore đã khởi tạo tại {SHARED_VECTOR_DB_DIR}")
+            print(f"❌ [PostgreSQL] Lỗi khởi tạo VectorStore: {e}")
+            raise  # Không fallback, bắt buộc dùng PostgreSQL
     else:
         print(f"[Shared DB] Sử dụng lại Shared VectorStore đã có (user: {user_email})")
     
@@ -475,23 +628,10 @@ async def on_start_after_login():
     
     print(f"✅ VectorStore cho user '{user_email}' đã sẵn sàng (mode=Similarity K=100)")
     
-    # 2. Khởi tạo Tổng đài (như cũ)
-    global GLOBAL_MESSAGE_QUEUE, POLLER_STARTED, NOTIFICATION_POLLER_STARTED
-    if GLOBAL_MESSAGE_QUEUE is None:
-        try:
-            GLOBAL_MESSAGE_QUEUE = asyncio.Queue()
-            print("✅ [Global] Hàng đợi TỔNG ĐÀI đã được khởi tạo.")
-        except Exception as e:
-            print(f"❌ [Global] Lỗi khởi tạo Hàng đợi Tổng: {e}")
-            
-    if not POLLER_STARTED:
-        try:
-            asyncio.create_task(global_broadcaster_poller())
-            POLLER_STARTED = True
-            print("✅ [Global] Đã khởi động TỔNG ĐÀI (Broadcaster).")
-        except Exception as e:
-            print(f"❌ [Global] Lỗi khởi động Tổng đài: {e}")
+    # 2. Khởi tạo Tổng đài - Gọi idempotent init function
+    _init_global_queue()
     
+    global NOTIFICATION_POLLER_STARTED
     if not NOTIFICATION_POLLER_STARTED:
         try:
             asyncio.create_task(task_notification_poller())
@@ -519,52 +659,77 @@ async def on_start_after_login():
         )
         
         if upcoming_tasks:
-            task_list = cl.TaskList()
-            task_list.status = f"📋 Công việc sắp đến hạn ({len(upcoming_tasks)})"
+            # Không dùng TaskList nữa, hiển thị từng task với button edit riêng
+            content = f"📋 **Công việc sắp đến hạn ({len(upcoming_tasks)})**\n\n"
             
-            for task in upcoming_tasks[:5]:  # Chỉ hiển thị 5 task đầu
+            for i, task in enumerate(upcoming_tasks[:5], 1):  # Chỉ hiển thị 5 task đầu
                 due_date = task.get('due_date', '')
                 priority = task.get('priority', 'medium')
                 task_id = task.get('id')
+                title = task.get('title', 'Untitled')
                 
-                # Format due date
+                # Format due date - FIX: handle datetime object
                 try:
-                    from datetime import datetime
-                    dt = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
-                    due_str = dt.strftime('%d/%m %H:%M')
+                    if isinstance(due_date, str):
+                        dt = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
+                        due_str = dt.strftime('%d/%m %H:%M')
+                    elif hasattr(due_date, 'strftime'):  # datetime object
+                        due_str = due_date.strftime('%d/%m %H:%M')
+                    else:
+                        due_str = str(due_date)[:16] if due_date else 'N/A'
                 except:
-                    due_str = due_date[:16] if due_date else 'N/A'
+                    due_str = str(due_date)[:16] if due_date else 'N/A'
                 
                 # Icon theo priority
                 icon_map = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
                 icon = icon_map.get(priority, '⚪')
                 
-                # Tạo action để mở popup edit task
-                cl_task = cl.Task(
-                    title=f"{icon} {task['title']} • {due_str}",
-                    status=cl.TaskStatus.READY,
-                    forId=f"task_{task_id}"  # ID để click vào sẽ trigger action
-                )
-                await task_list.add_task(cl_task)
+                content += f"{i}. {icon} **{title}** • _{due_str}_\n"
             
-            await task_list.send()
+            # Tạo actions cho từng task
+            actions = []
+            for task in upcoming_tasks[:5]:
+                task_id = task.get('id')
+                title = task.get('title', 'Task')[:20]  # Truncate title
+                actions.append(
+                    cl.Action(
+                        name=f"edit_task_{task_id}",
+                        label=f"✏️ {title}",
+                        payload={"action": "edit_task", "task_id": task_id}
+                    )
+                )
+            
+            # Thêm button xem tất cả
+            actions.append(
+                cl.Action(name="view_tasks", label="📋 Xem tất cả", payload={"action": "view_tasks"})
+            )
+            
+            await cl.Message(content=content, actions=actions).send()
             print(f"✅ [TaskList] Hiển thị {len(upcoming_tasks[:5])} tasks sắp đến hạn")
         else:
             print("ℹ️ [TaskList] Không có task sắp đến hạn")
-        
-        # Gửi message với button để xem/edit tasks (LUÔN hiển thị)
-        actions = [
-            cl.Action(name="view_tasks", label="📋 Xem & Edit Tasks", payload={"action": "view_tasks"})
-        ]
-        await cl.Message(
-            content="💡 _Click nút bên dưới để xem chi tiết và chỉnh sửa công việc_",
-            actions=actions
-        ).send()
+            # Vẫn hiển thị button xem tất cả
+            actions = [
+                cl.Action(name="view_tasks", label="📋 Xem & Edit Tasks", payload={"action": "view_tasks"})
+            ]
+            await cl.Message(
+                content="💡 _Click nút bên dưới để xem chi tiết và chỉnh sửa công việc_",
+                actions=actions
+            ).send()
             
     except Exception as e:
         print(f"⚠️ [TaskList] Lỗi khi load tasks: {e}")
     
-    # 4. Gọi hàm setup chat chính
+    # DEBUG: Check user_id_str before starting poller
+    user_id_str_check = cl.user_session.get("user_id_str")
+    print(f"[DEBUG on_chat_start] user_id_str = {user_id_str_check}")
+    print(f"[DEBUG on_chat_start] ACTIVE_SESSION_QUEUES before poller: {list(ACTIVE_SESSION_QUEUES.keys())}")
+    
+    # 4. Khởi động subscriber poller để nhận push notifications
+    asyncio.create_task(session_receiver_poller())
+    print("✅ [on_chat_start] Đã khởi động session_receiver_poller")
+    
+    # 5. Gọi hàm setup chat chính
     await setup_chat_session(user)
 
 @cl.on_chat_resume
@@ -722,6 +887,18 @@ def init_user_db():
         name TEXT
     );
     """)
+    
+    # Tạo bảng lưu FCM tokens
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS fcm_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_email TEXT NOT NULL,
+        fcm_token TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_email, fcm_token)
+    );
+    """)
     conn.commit()
     conn.close()
     # === MỚI: Thêm bảng cho Checklist Công việc (V2: Priority + Tags + Assign) ===
@@ -821,10 +998,11 @@ def authenticate_user(email: str, password: str) -> Optional[dict]:
     
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 350)
 
-def _get_note_by_id_db(vectorstore: Chroma, doc_id: str) -> Optional[str]:
+def _get_note_by_id_db(vectorstore: Any, doc_id: str) -> Optional[str]:
     """(SYNC) Lấy nội dung văn bản đầy đủ của 1 doc_id."""
     try:
-        result = vectorstore._collection.get(
+        result = _vectorstore_get(
+            vectorstore,
             ids=[doc_id],
             include=["documents"]
         )
@@ -867,7 +1045,7 @@ def _delete_task_by_title_db(user_email: str, title_query: str) -> int:
 # (Dán hàm MỚI này vào khoảng dòng 520)
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 520)
 def _delete_note_by_content_db(
-    vectorstore: Chroma, 
+    vectorstore: Any, 
     llm: ChatOpenAI, # <-- 1. THÊM LLM
     content_query: str, 
     dry_run: bool = False
@@ -881,9 +1059,10 @@ def _delete_note_by_content_db(
     try:
         # --- BƯỚC 1: TÌM GẦN GIỐNG (VECTOR SEARCH) ---
         query_vector = embeddings.embed_query(content_query)
-        results = vectorstore._collection.query(
+        results = _vectorstore_query(
+            vectorstore,
             query_embeddings=[query_vector],
-            n_results=20, # Lấy 20 ứng viên
+            n_results=20,  # Lấy 20 ứng viên
             include=["documents"]
         )
         
@@ -930,7 +1109,7 @@ def _delete_note_by_content_db(
             return [r['doc'] for r in filtered_results]
         else:
             ids_to_delete = [r['id'] for r in filtered_results]
-            vectorstore._collection.delete(ids=ids_to_delete)
+            _vectorstore_delete(vectorstore, ids=ids_to_delete)
             print(f"[NoteDB] Đã xóa {len(ids_to_delete)} ghi chú (LLM): '{content_query}'")
             return len(ids_to_delete)
         
@@ -1009,7 +1188,7 @@ def _find_reminders_by_text_db(text_query: str) -> List[dict]:
 
     return found
 
-def _find_files_by_name_db(vectorstore: Chroma, name_query: str) -> List[dict]:
+def _find_files_by_name_db(vectorstore: Any, name_query: str) -> List[dict]:
     """
     (OPTIMIZATION V2 - NHANH HƠN 5-10 LẦN)
     Tìm file/image bằng cách:
@@ -1021,7 +1200,7 @@ def _find_files_by_name_db(vectorstore: Chroma, name_query: str) -> List[dict]:
         user_email = cl.user_session.get("user_email", "unknown")
         
         # BƯỚC 1: Lấy tất cả file (1 query) - NHANH + FILTER theo user_id
-        data = vectorstore._collection.get(
+        data = _vectorstore_get(vectorstore, 
             where={
                 "$and": [
                     {"user_id": user_email},
@@ -1423,7 +1602,7 @@ Output (Chỉ trả về các ID, mỗi ID một dòng. KHÔNG GIẢI THÍCH):
     
     
 def _find_notes_for_deletion(
-    vectorstore: Chroma, 
+    vectorstore: Any, 
     llm: ChatOpenAI, 
     content_query: str
 ) -> List[dict]:
@@ -1437,9 +1616,10 @@ def _find_notes_for_deletion(
     try:
         # --- BƯỚC 1: TÌM GẦN GIỐNG (VECTOR SEARCH) ---
         query_vector = embeddings.embed_query(content_query)
-        results = vectorstore._collection.query(
+        results = _vectorstore_query(
+            vectorstore,
             query_embeddings=[query_vector],
-            n_results=20, # Lấy 20 ứng viên
+            n_results=20,  # Lấy 20 ứng viên
             include=["documents"]
         )
         
@@ -1614,7 +1794,7 @@ def _get_task_status_db(task_id: int) -> bool:
     
     
 # (Dán hàm mới này vào khoảng dòng 472)
-def _delete_task_db(user_email: str, vectorstore: Chroma, query: str) -> int:
+def _delete_task_db(user_email: str, vectorstore: Any, query: str) -> int:
     """(SYNC) Tìm và xóa task dựa trên query (ID hoặc nội dung)."""
     conn = _get_user_db_conn()
     conn.row_factory = sqlite3.Row
@@ -1646,7 +1826,7 @@ def _delete_task_db(user_email: str, vectorstore: Chroma, query: str) -> int:
                 
     conn.close()
     return deleted_count
-def remove_job_by_id_or_content(scheduler: AsyncIOScheduler, vectorstore: Chroma, query: str) -> int:
+def remove_job_by_id_or_content(scheduler: AsyncIOScheduler, vectorstore: Any, query: str) -> int:
     """(SYNC) Tìm và xóa job/reminder dựa trên ID hoặc nội dung."""
     if not SCHEDULER: return 0
     
@@ -1686,13 +1866,13 @@ def remove_job_by_id_or_content(scheduler: AsyncIOScheduler, vectorstore: Chroma
                 
                 # (SỬA LỖI: Cần dùng query để tìm doc_id trong vectorstore)
                 def _get_doc_ids_sync():
-                     return vectorstore._collection.get(where_document={"$contains": regex_pattern})
+                     return _vectorstore_get(vectorstore, where_document={"$contains": regex_pattern})
 
                 existing_docs = _get_doc_ids_sync()
                 ids_to_delete = existing_docs.get("ids", [])
                 
                 if ids_to_delete:
-                    vectorstore._collection.delete(ids=ids_to_delete)
+                    _vectorstore_delete(vectorstore, ids=ids_to_delete)
                     print(f"[RemDB] Đã dọn dẹp vectorstore cho job: {job.id}")
             except Exception as e:
                 print(f"[RemDB] Lỗi khi xóa job {job.id}: {e}")
@@ -1757,7 +1937,7 @@ async def ui_show_uncompleted_tasks(
     if filter_title:
         title = f"📝 **{len(tasks)} công việc chưa hoàn thành (cho '{filter_title}'):**"
     else:
-         title = f"📝 **Danh sách {len(tasks)} công việc chưa hoàn thành:**"
+         title = f"📝 **Danh sách {len(tasks)} công việc (Chưa hoàn thành):**"
 
     if not tasks:
         if filter_title:
@@ -1850,7 +2030,7 @@ async def ui_show_completed_tasks():
 
 
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 865)
-def _push_task_notification(
+def _push_task_notification_impl(
     internal_session_id: str, 
     task_title: str, 
     task_id: int, 
@@ -1880,19 +2060,105 @@ def _push_task_notification(
     print(f"[TaskPush] Task ID: {task_id} CHƯA hoàn thành. Đang Push...")
     _do_push(internal_session_id, f"Đến hạn công việc: {task_title}")
     
-    # 3. (MỚI) Lên lịch kiểm tra lặp lại (nếu có)
+    # 2.5. Gửi FCM notification cho task
+    try:
+        conn = _get_user_db_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT fcm_token FROM fcm_tokens WHERE user_email = (SELECT user_email FROM tasks WHERE id = ?)", (task_id,))
+        tokens = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if tokens:
+            message = messaging.MulticastMessage(
+                notification=messaging.Notification(
+                    title="⏰ Đến hạn công việc",
+                    body=task_title[:100]
+                ),
+                data={
+                    "type": "task",
+                    "task_id": str(task_id),
+                    "title": task_title
+                },
+                tokens=tokens
+            )
+            response = messaging.send_multicast(message)
+            print(f"[TaskPush] 🔥 FCM sent: {response.success_count}/{len(tokens)} success")
+    except Exception as e:
+        print(f"[TaskPush] ⚠️ FCM error: {e}")
+    
+    # 3. (MỚI) Lên lịch kiểm tra lặp lại (nếu có) - CHỈ TẠO 1 JOB CHO LẦN TIẾP THEO
     if repeat_min and repeat_min > 0:
         if not SCHEDULER:
             print("[TaskPush] Lỗi: Không tìm thấy SCHEDULER để lặp lại.")
             return
             
         try:
+            # Lấy recurrence_rule để check COUNT
+            conn = get_task_db_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT recurrence_rule FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            conn.close()
+            
+            if not row or not row[0]:
+                print(f"[TaskPush] Task #{task_id} không có recurrence_rule, dừng lặp.")
+                return
+            
+            recurrence_rule = row[0]
+            
+            # Parse COUNT từ rule (format: "FREQ=DAILY;INTERVAL=1;COUNT=5")
+            max_count = None
+            current_count = 0
+            
+            if 'COUNT=' in recurrence_rule.upper():
+                try:
+                    count_part = [p for p in recurrence_rule.split(';') if 'COUNT=' in p.upper()][0]
+                    max_count = int(count_part.split('=')[1])
+                except:
+                    pass
+            
+            # Lấy số lần đã lặp từ database (hoặc tạo bảng tracking)
+            conn = _get_user_db_conn()
+            cursor = conn.cursor()
+            
+            # Tạo bảng tracking nếu chưa có
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS task_repeat_count (
+                    task_id INTEGER PRIMARY KEY,
+                    repeat_count INTEGER DEFAULT 0,
+                    last_push_at DATETIME
+                )
+            """)
+            
+            # Lấy count hiện tại
+            cursor.execute("SELECT repeat_count FROM task_repeat_count WHERE task_id = ?", (task_id,))
+            count_row = cursor.fetchone()
+            
+            if count_row:
+                current_count = count_row[0] + 1
+                cursor.execute("UPDATE task_repeat_count SET repeat_count = ?, last_push_at = ? WHERE task_id = ?",
+                             (current_count, datetime.now(VN_TZ).isoformat(), task_id))
+            else:
+                current_count = 1
+                cursor.execute("INSERT INTO task_repeat_count (task_id, repeat_count, last_push_at) VALUES (?, ?, ?)",
+                             (task_id, current_count, datetime.now(VN_TZ).isoformat()))
+            
+            conn.commit()
+            conn.close()
+            
+            # Kiểm tra xem đã đạt COUNT chưa
+            if max_count and current_count >= max_count:
+                print(f"[TaskPush] Task #{task_id} đã lặp {current_count}/{max_count} lần. DỪNG lặp lại.")
+                return
+            
+            # Tạo job CHỈ cho lần tiếp theo (không tạo hàng loạt)
             next_run_dt = datetime.now(VN_TZ) + timedelta(minutes=repeat_min)
             new_job_id = f"taskpush-check-{task_id}-{uuid.uuid4().hex[:6]}"
             
-            print(f"[TaskPush] Đã lên lịch kiểm tra lặp lại cho Task ID: {task_id} sau {repeat_min} phút (Job: {new_job_id})")
+            count_info = f" ({current_count}/{max_count})" if max_count else f" (lần {current_count})"
+            print(f"[TaskPush] Lên lịch lần tiếp theo cho Task #{task_id} sau {repeat_min}p{count_info} (Job: {new_job_id})")
             
-            # Lên lịch gọi lại CHÍNH NÓ (tạo vòng lặp)
+            # Lên lịch gọi lại CHÍNH NÓ (CHỈ 1 job cho lần sau)
             SCHEDULER.add_job(
                 _push_task_notification, 
                 trigger=DateTrigger(run_date=next_run_dt, timezone=VN_TZ),
@@ -2136,22 +2402,22 @@ else:
         chunk_size=100
     )
 
-# 🚀 PostgreSQL + pgvector Initialization
+# 🚀 PostgreSQL Initialization with pgvector extension
 print("🔌 [PostgreSQL] Kiểm tra kết nối PostgreSQL...")
 try:
     init_connection_pool(min_conn=2, max_conn=20)
     if test_connection():
         print("✅ [PostgreSQL] Kết nối thành công")
-        init_pgvector_extension()
-        print("✅ [pgvector] Extension đã được kích hoạt")
+        print("✅ [PostgreSQL] Sử dụng pgvector extension cho vector search")
     else:
-        print("❌ [PostgreSQL] Không thể kết nối. Fallback sang ChromaDB (SQLite)")
+        print("❌ [PostgreSQL] Không thể kết nối")
+        raise ConnectionError("PostgreSQL connection failed")
 except Exception as e:
     print(f"❌ [PostgreSQL] Lỗi khởi tạo: {e}")
-    print("⚠️  Fallback sang ChromaDB (SQLite)")
+    raise  # Không fallback, bắt buộc fix PostgreSQL
 def get_shared_vectorstore_retriever() -> Tuple[Any, Any]:
     """
-    (MỚI - 1 DB CHUNG - MIGRATED TO PostgreSQL + pgvector)
+    (MỚI - 1 DB CHUNG - PostgreSQL Native)
     Khởi tạo Vectorstore CHUNG cho TẤT CẢ user.
     Filter theo metadata['user_id'] khi query.
     """
@@ -2165,10 +2431,10 @@ def get_shared_vectorstore_retriever() -> Tuple[Any, Any]:
         raise ValueError("Lỗi: Embeddings chưa được khởi tạo (OPENAI_API_KEY có thể bị thiếu).")
     
     try:
-        # 🚀 Khởi tạo PGVector (PostgreSQL + pgvector)
+        # 🚀 Khởi tạo PostgreSQL Native VectorStore (KHÔNG CẦN pgvector extension)
         connection_string = get_postgres_connection_string()
         
-        _SHARED_VECTORSTORE = PGVectorStore(
+        _SHARED_VECTORSTORE = PGVector(
             connection=connection_string,
             embeddings=embeddings,
             collection_name=_PGVECTOR_COLLECTION_NAME,
@@ -2178,11 +2444,11 @@ def get_shared_vectorstore_retriever() -> Tuple[Any, Any]:
         # Retriever không filter (sẽ filter sau khi query)
         _SHARED_RETRIEVER = _SHARED_VECTORSTORE.as_retriever(search_kwargs={"k": 100})
         
-        print(f"✅ [PGVector] Shared VectorStore đã sẵn sàng (PostgreSQL collection: {_PGVECTOR_COLLECTION_NAME})")
+        print(f"✅ [PostgreSQL] Shared VectorStore đã sẵn sàng (Native collection: {_PGVECTOR_COLLECTION_NAME})")
         return _SHARED_VECTORSTORE, _SHARED_RETRIEVER
         
     except Exception as e:
-        print(f"❌ [PGVector] Lỗi khởi tạo: {e}")
+        print(f"❌ [PostgreSQL] Lỗi khởi tạo: {e}")
         print("⚠️  Fallback sang ChromaDB (SQLite)...")
         
         # Fallback to ChromaDB
@@ -2312,7 +2578,7 @@ def list_sessions(user_id_str: str) -> List[dict]:
 # =========================================================
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1210)
 def _save_image_and_note(
-    vectorstore: Chroma,
+    vectorstore: Any,
     src_path: str, 
     user_text: str, 
     original_name: str,
@@ -2350,7 +2616,7 @@ def _save_image_and_note(
 
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1700)
 def _save_file_and_note(
-    vectorstore: Chroma,
+    vectorstore: Any,
     src_path: str, 
     original_name: Optional[str], 
     user_text: str,
@@ -2403,7 +2669,7 @@ def _get_text_splitter() -> RecursiveCharacterTextSplitter:
 
 # (THAY THẾ HÀM NÀY - KHOẢNG DÒNG 1270)
 def _load_and_process_document(
-    vectorstore: Chroma,
+    vectorstore: Any,
     src_path: str, 
     original_name: str, 
     mime_type: str, 
@@ -2518,11 +2784,11 @@ def _load_and_process_document(
 # =========================================================
 # 🧩 Tiện ích xem bộ nhớ (Đã sửa đổi)
 # =========================================================
-def dump_all_memory_texts(vectorstore: Chroma) -> str: # <-- SỬA
+def dump_all_memory_texts(vectorstore: Any) -> str: # <-- SỬA
     """SỬA ĐỔI: Nhận vectorstore của user."""
     try:
         user_email = cl.user_session.get("user_email", "unknown")
-        raw = vectorstore._collection.get(
+        raw = _vectorstore_get(vectorstore, 
             where={"user_id": user_email},
             include=["documents"]
         )
@@ -2536,7 +2802,7 @@ def dump_all_memory_texts(vectorstore: Chroma) -> str: # <-- SỬA
 # ==================== PATCH 5: TỐI ƯU HÓA HÀM LIST_ACTIVE_FILES ====================
 # THAY THẾ hàm list_active_files (khoảng dòng 2132)
 
-def list_active_files(vectorstore: Chroma) -> list[dict]:
+def list_active_files(vectorstore: Any) -> list[dict]:
     """
     (OPTIMIZATION V2)
     Quét ChromaDB lấy file/ảnh (NHANH - chỉ 1 query).
@@ -2545,19 +2811,39 @@ def list_active_files(vectorstore: Chroma) -> list[dict]:
     try:
         user_email = cl.user_session.get("user_email", "unknown")
         
-        # OPTIMIZATION: Chỉ lấy metadatas (không cần documents) + FILTER theo user_id
-        data = vectorstore._collection.get(
-            where={
-                "$and": [
-                    {"user_id": user_email},
-                    {"file_type": {"$ne": "text"}}
-                ]
-            },
-            include=["metadatas"]  # Không cần documents
-        )
-        
-        ids = data.get("ids", [])
-        metadatas = data.get("metadatas", [])
+        # Use wrapper function for PGVector compatibility
+        if hasattr(vectorstore, '_collection'):
+            # ChromaDB API
+            data = _vectorstore_get(vectorstore, 
+                where={
+                    "$and": [
+                        {"user_id": user_email},
+                        {"file_type": {"$ne": "text"}}
+                    ]
+                },
+                include=["metadatas"]
+            )
+            ids = data.get("ids", [])
+            metadatas = data.get("metadatas", [])
+        else:
+            # PGVector - use similarity_search with filter
+            from langchain_postgres.vectorstores import PGVector
+            if isinstance(vectorstore, PGVector):
+                # Get all documents for user (filter by metadata)
+                docs = vectorstore.similarity_search(
+                    "",  # Empty query to get all
+                    k=1000,  # Large limit
+                    filter={"user_id": user_email}
+                )
+                # Filter out text files
+                ids = []
+                metadatas = []
+                for doc in docs:
+                    if doc.metadata.get("file_type") != "text":
+                        ids.append(doc.metadata.get("id", doc.metadata.get("chroma_id", "")))
+                        metadatas.append(doc.metadata)
+            else:
+                raise ValueError(f"Unsupported vectorstore type: {type(vectorstore)}")
         
         for doc_id, metadata in zip(ids, metadatas):
             if not metadata:
@@ -2677,7 +2963,7 @@ async def ui_show_all_memory():
     
     # Phải chạy sync - Lấy tất cả text, sau đó lọc chunk
     def _get_docs_sync():
-        return vectorstore._collection.get(
+        return _vectorstore_get(vectorstore, 
             where={"file_type": "text"},
             include=["documents", "metadatas"]
         )
@@ -2960,17 +3246,18 @@ def ensure_scheduler():
                 job_defaults={"max_instances": 3, "coalesce": False}
             )
             SCHEDULER.start()
-            print(f"[Scheduler] Đã khởi động với JobStore tại: {JOBSTORE_DB_FILE}")
-            # Lên lịch đồng bộ User
+            print("[Scheduler] Đã khởi động với PostgreSQL JobStore")
+            # Lên lịch đồng bộ User (dùng MemoryJobStore - không persist)
             SCHEDULER.add_job(
                 _sync_users_from_api_sync, # Hàm worker (sync)
                 trigger='interval',        # Kiểu lặp
                 minutes=1,                 # Thời gian lặp
                 id='sync_users_job',       # Tên job (để không bị trùng)
+                jobstore='memory',         # ✅ Dùng memory store - không lưu vào DB
                 replace_existing=True,
                 next_run_time=datetime.now(VN_TZ) + timedelta(seconds=5) # Chạy lần đầu sau 5s
             )
-            print("✅ [Scheduler] Đã lên lịch đồng bộ User (mỗi 3 phút).")
+            print("✅ [Scheduler] Đã lên lịch đồng bộ User (mỗi 3 phút - memory store).")
         except Exception as e:
             print(f"[Scheduler] LỖI NGHIÊM TRỌNG KHI KHỞI ĐỘNG: {e}")
             print("[Scheduler] LỖI: Có thể bạn cần xóa file 'memory_db/jobs.sqlite' nếu cấu trúc DB thay đổi.")
@@ -3256,9 +3543,10 @@ def _cancel_escalation(user_id_str: str): # <-- SỬA: Nhận user_id_str
     if st:
         print(f"[Escalation] Đã dọn dẹp in-memory cho {user_id_str}")
         
-def _tick_job_sync(user_id_str, text, repeat_job_id): # <-- SỬA: Nhận user_id_str
+def _tick_job_sync_impl(user_id_str, text, repeat_job_id): # <-- SỬA: Nhận user_id_str
     """
-    (SỬA LẠI) Hàm sync để APScheduler gọi (cho escalation).
+    (IMPLEMENTATION) Hàm sync để APScheduler gọi (cho escalation).
+    Được gọi qua scheduler_jobs._tick_job_sync() wrapper
     """
     try:
         st = ACTIVE_ESCALATIONS.get(user_id_str) # <-- SỬA: Dùng user_id_str
@@ -3278,14 +3566,15 @@ def _tick_job_sync(user_id_str, text, repeat_job_id): # <-- SỬA: Nhận user_i
     except Exception as e:
         print(f"[ERROR] _tick_job_sync crashed: {e}")
 
-def _first_fire_escalation_job(user_id_str, text, every_sec): # <-- SỬA: Nhận user_id_str
+def _first_fire_escalation_job_impl(user_id_str, text, every_sec):
     """
-    Hàm (sync) được gọi cho LẦN ĐẦU TIÊN của 1 lịch leo thang.
+    (IMPLEMENTATION) Hàm (sync) được gọi cho LẦN ĐẦU TIÊN của 1 lịch leo thang.
+    Được gọi qua scheduler_jobs._first_fire_escalation_job() wrapper
     """
     try:
         print(f"[Escalation] First fire (sync) for {user_id_str} at {datetime.now(VN_TZ)}")
-        _do_push(user_id_str, text) # <-- SỬA: Dùng user_id_str
-        _schedule_escalation_after_first_fire(user_id_str, text, every_sec) # <-- SỬA
+        _do_push_impl(user_id_str, text)  # Gọi _impl
+        _schedule_escalation_after_first_fire(user_id_str, text, every_sec)
     except Exception as e:
         print(f"[ERROR] _first_fire_escalation_job crashed: {e}")
 
@@ -3305,27 +3594,97 @@ def _schedule_escalation_after_first_fire(user_id_str: str, noti_text: str, ever
         )
         print(f"[Escalation] Đã bật lặp mỗi {every_sec}s với job_id={repeat_job_id} cho User {user_id_str}") # <-- SỬA
 
-def _do_push(user_id_str: str, noti_text: str):
+def _do_push_impl(user_id_str: str, noti_text: str):
     """
-    (SỬA LẠI) Hàm (sync) thực thi push (Kiến trúc Tổng đài).
-    (SỬA LỖI: Thêm 'user' vào payload API theo yêu cầu)
+    (IMPLEMENTATION) Hàm (sync) thực thi push - SIMPLIFIED VERSION
+    Gửi trực tiếp vào ACTIVE_SESSION_QUEUES của user (không qua GLOBAL_MESSAGE_QUEUE)
     """
     ts = datetime.now(VN_TZ).isoformat()
     
-    # 1. Gửi tin nhắn vào Hàng đợi Tổng (Internal UI push)
+    # DEBUG: Log tất cả users đang online
+    print(f"[Push/Debug] ACTIVE_SESSION_QUEUES keys: {list(ACTIVE_SESSION_QUEUES.keys())}")
+    print(f"[Push/Debug] Target user: {user_id_str}")
+    
+    # 1. Push message trực tiếp vào session queues của user (nếu đang online)
     try:
-        if GLOBAL_MESSAGE_QUEUE:
-            GLOBAL_MESSAGE_QUEUE.put_nowait({
-                "author": "Trợ lý ⏰",
-                "content": f"⏰ Nhắc: {noti_text}\n🕒 {ts}",
-                "target_user_id": user_id_str 
-            })
-            print(f"[Push/Queue] Đã gửi tin nhắn vào TỔNG ĐÀI cho User: {user_id_str}.")
+        content = f"⏰ ĐÃ ĐẾN GIỜ: {noti_text}\n🕒 {ts}"
+        msg_data = {
+            "author": "Trợ lý ⏰",
+            "content": content,
+            "target_user_id": user_id_str
+        }
+        
+        # Lấy tất cả session queues của user này
+        queues_for_user = ACTIVE_SESSION_QUEUES.get(user_id_str, [])
+        
+        if queues_for_user:
+            # User đang online, gửi message vào tất cả tabs
+            sent_count = 0
+            for session_queue in queues_for_user:
+                if session_queue:
+                    try:
+                        # Gửi từ thread khác vào asyncio queue (thread-safe)
+                        session_queue.put_nowait(msg_data)
+                        sent_count += 1
+                    except Exception as e:
+                        print(f"[Push] ⚠️ Lỗi gửi vào session queue: {e}")
+            
+            if sent_count > 0:
+                print(f"[Push] ✅ Đã gửi notification đến {sent_count} tab của user {user_id_str}")
+            else:
+                print(f"[Push] ⚠️ User {user_id_str} có {len(queues_for_user)} queues nhưng không gửi được")
         else:
-            print("[Push/Queue] LỖI: GLOBAL_MESSAGE_QUEUE is None.")
+            # User không online, lưu tạm vào PENDING_BROADCASTS
+            PENDING_BROADCASTS.append(msg_data)
+            print(f"[Push] 💾 User {user_id_str} offline, lưu vào PENDING_BROADCASTS ({len(PENDING_BROADCASTS)} pending)")
             
     except Exception as e:
-        print(f"[Push/Queue] Lỗi put_nowait (Tổng đài): {e}")
+        print(f"[Push] ❌ Lỗi: {e}")
+
+    # 1.5. Gửi Firebase Cloud Messaging (FCM) notification
+    try:
+        # Lấy FCM tokens của user từ database
+        conn = _get_user_db_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT fcm_token FROM fcm_tokens WHERE user_email = ?", (user_id_str,))
+        tokens = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        
+        if tokens:
+            # Tạo FCM message
+            message = messaging.MulticastMessage(
+                notification=messaging.Notification(
+                    title="⏰ Đến giờ nhắc việc",
+                    body=noti_text[:100]
+                ),
+                data={
+                    "type": "reminder",
+                    "user": user_id_str,
+                    "text": noti_text
+                },
+                tokens=tokens
+            )
+            
+            # Gửi notification
+            response = messaging.send_multicast(message)
+            print(f"[Push] 🔥 FCM sent: {response.success_count}/{len(tokens)} success, {response.failure_count} failed")
+            
+            # Xóa tokens không hợp lệ
+            if response.failure_count > 0:
+                for idx, result in enumerate(response.responses):
+                    if not result.success:
+                        invalid_token = tokens[idx]
+                        conn = _get_user_db_conn()
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM fcm_tokens WHERE fcm_token = ?", (invalid_token,))
+                        conn.commit()
+                        conn.close()
+                        print(f"[Push] 🗑️ Removed invalid FCM token")
+        else:
+            print(f"[Push] ℹ️ No FCM tokens for user {user_id_str}")
+            
+    except Exception as e:
+        print(f"[Push] ⚠️ FCM error: {e}")
 
     # 2. Gọi API Frappe
     big_md = "# ⏰ **NHẮC VIỆC**\n\n## " + noti_text + "\n\n**🕒 " + ts + "**"
@@ -3363,7 +3722,7 @@ async def _on_delete_note(action: cl.Action):
 
     try:
         # Dùng to_thread để xóa (I/O)
-        await asyncio.to_thread(vectorstore._collection.delete, ids=[doc_id])
+        await asyncio.to_thread(_vectorstore_delete, vectorstore, ids=[doc_id])
         # Note: Chainlit không hỗ trợ xóa message đã gửi
         # Chỉ gửi thông báo xác nhận
         await cl.Message(content=f"✅ Đã xóa ghi chú: {doc_id}").send()
@@ -3458,7 +3817,7 @@ async def _on_show_chunks_debug(action: cl.Action):
     try:
         # 1. Lấy parent document để xem parent_id
         parent_data = await asyncio.to_thread(
-            vectorstore._collection.get,
+            _vectorstore_get, vectorstore,
             ids=[doc_id],
             include=["metadatas"]
         )
@@ -3475,7 +3834,7 @@ async def _on_show_chunks_debug(action: cl.Action):
         if entry_type == "parent_doc" and parent_id:
             # ChromaDB không hỗ trợ nhiều điều kiện where → lọc sau
             chunks_data = await asyncio.to_thread(
-                vectorstore._collection.get,
+                _vectorstore_get, vectorstore,
                 where={"parent_id": parent_id},
                 include=["documents", "metadatas"]
             )
@@ -3548,7 +3907,7 @@ async def display_interactive_list(where_clause: dict, title: str):
         await cl.Message(content=f"**{title} (Mới nhất lên đầu)**").send() # <-- (V94) Thêm
         
         results = await asyncio.to_thread(
-            vectorstore._collection.get, 
+            _vectorstore_get, vectorstore, 
             where=combined_where,
             include=["documents", "metadatas"] 
         )
@@ -3776,7 +4135,7 @@ async def ui_show_all_memory():
     
     # Phải chạy sync - Lấy tất cả text, sau đó lọc chunk
     def _get_docs_sync():
-        return vectorstore._collection.get(
+        return _vectorstore_get(vectorstore, 
             where={"file_type": "text"},
             include=["documents", "metadatas"]
         )
@@ -3888,6 +4247,13 @@ async def ui_show_all_memory():
 async def global_broadcaster_poller():
     """(MỚI) HÀM TỔNG ĐÀI - Chạy 1 lần duy nhất."""
     print("✅ [Tổng đài] Global Broadcaster đã khởi động.")
+    # Phát các tin nhắn pending nếu có
+    global PENDING_BROADCASTS
+    if PENDING_BROADCASTS and GLOBAL_MESSAGE_QUEUE:
+        for pending in PENDING_BROADCASTS:
+            await GLOBAL_MESSAGE_QUEUE.put(pending)
+        print(f"[Tổng đài] 📤 Đã nạp {len(PENDING_BROADCASTS)} tin nhắn pending vào queue.")
+        PENDING_BROADCASTS = []
     while True:
         try:
             if GLOBAL_MESSAGE_QUEUE is None:
@@ -4001,16 +4367,16 @@ async def task_notification_poller():
                 queues_for_user = ACTIVE_SESSION_QUEUES.get(user_email, [])
                 
                 if queues_for_user:
-                    # Build notification message
+                    # Build notification message (format để trigger notify.js)
                     if notification_type == "REMIND":
-                        icon = "🔔"
-                        title_text = "Nhắc nhở công việc"
+                        icon = "⏰🔔"
+                        title_text = "ĐÃ ĐẾN GIỜ"
                     else:  # REPEAT
-                        icon = "🔁"
-                        title_text = "Công việc lặp lại"
+                        icon = "⏰🔁"
+                        title_text = "ĐÃ ĐẾN GIỜ (Lặp lại)"
                     
-                    content = f"{icon} **{title_text}**\n\n"
-                    content += f"**{task_title}**\n\n"
+                    # Format: "⏰ ĐÃ ĐẾN GIỜ: **Task Title**" để trigger notify.js
+                    content = f"{icon} **{title_text}: {task_title}**\n\n"
                     if task_description:
                         content += f"_{task_description}_\n\n"
                     content += f"⏰ _Thời gian: {created_at}_"
@@ -4052,9 +4418,13 @@ async def task_notification_poller():
 async def session_receiver_poller():
     """(MỚI) HÀM THUÊ BAO - Chạy 1 lần cho MỖI TAB."""
     
+    print("[DEBUG Poller] session_receiver_poller() được gọi!")
+    
     # --- 🚀 BẮT ĐẦU SỬA LỖI (User-based) 🚀 ---
     my_queue = asyncio.Queue()
     user_id_str = cl.user_session.get("user_id_str", None)
+    
+    print(f"[DEBUG Poller] Lấy user_id_str từ session: {user_id_str}")
     
     if not user_id_str:
         print("❌ [Thuê bao] LỖI NGHIÊM TRỌNG: Không tìm thấy user_id_str khi bắt đầu poller.")
@@ -4139,9 +4509,10 @@ class CleanAgentExecutor(AgentExecutor):
 # =========================================================
 # (THAY THẾ TOÀN BỘ HÀM NÀY - khoảng dòng 1630)
 
-def _sync_users_from_api_sync():
+def _sync_users_from_api_sync_impl():
     """
-    (SYNC) Worker (ĐÃ CẬP NHẬT)
+    (IMPLEMENTATION) (SYNC) Worker (ĐÃ CẬP NHẬT)
+    Được gọi qua scheduler_jobs._sync_users_from_api_sync() wrapper
     (SỬA LỖI: Thêm logic đồng bộ cột 'name'.)
     """
     print("🔄 [Sync] Bắt đầu phiên đồng bộ user (có check admin, active, name)...")
@@ -4202,8 +4573,8 @@ def _sync_users_from_api_sync():
             if not email or not api_plain_password:
                 invalid += 1
                 continue
-            
-            email_low = email.lower()
+             
+            email_low = email.lower() 
             
             if email_low not in local_users:
                 # 4.3. TẠO MỚI (SỬA: Thêm 'name')
@@ -4258,6 +4629,26 @@ def _sync_users_from_api_sync():
         if conn: conn.rollback()
     finally:
         if conn: conn.close()
+
+# === INJECT CALLBACKS TO SCHEDULER_JOBS ===
+# Inject function references sau khi TẤT CẢ _impl functions đã được define
+scheduler_jobs.set_callbacks(
+    do_push_fn=_do_push_impl,
+    sync_users_fn=_sync_users_from_api_sync_impl,
+    first_fire_fn=_first_fire_escalation_job_impl,
+    push_task_fn=_push_task_notification_impl,
+    tick_fn=_tick_job_sync_impl
+)
+# === END INJECT ===
+
+# === FIREBASE ADMIN INITIALIZATION ===
+try:
+    cred = credentials.Certificate("firebase-admin-key.json")
+    firebase_admin.initialize_app(cred)
+    print("✅ [Firebase] Firebase Admin SDK initialized")
+except Exception as e:
+    print(f"⚠️ [Firebase] Init error: {e}")
+
 init_user_db()
 # =========================================================
 async def ui_show_active_reminders():
@@ -4422,7 +4813,7 @@ async def _on_delete_file(action: cl.Action):
 
     try:
         # --- SỬA LỖI TREO (9) ---
-        await asyncio.to_thread(vectorstore._collection.delete, ids=[doc_id])
+        await asyncio.to_thread(_vectorstore_delete, vectorstore, ids=[doc_id])
         msg += f"✅ Đã xóa metadata: {doc_id}\n"
     except Exception as e:
         msg += f"❌ Lỗi xóa metadata: {e}\n"
@@ -6183,7 +6574,7 @@ Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
         
         try:
             success = await asyncio.to_thread(
-                tm.mark_complete,
+                tm.complete_task,
                 task_id=task_id,
                 user_email=user_email
             )
@@ -6303,7 +6694,7 @@ Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
         📋 XEM DANH SÁCH CÔNG VIỆC
         Hiển thị tasks dưới dạng bảng tương tác với UI element.
         
-        filter_status: "uncompleted" (mặc định), "completed", hoặc "all"
+        filter_status: "uncompleted" (Chưa hoàn thành - mặc định), "completed" (Đã xong), hoặc "all" (Tất cả)
         """
         import task_manager as tm
         
@@ -6312,12 +6703,35 @@ Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
             return "❌ Lỗi: Không tìm thấy user_email"
         
         try:
-            # Get tasks
-            tasks = await asyncio.to_thread(
-                tm.get_tasks,
-                user_email=user_email,
-                status=filter_status
-            )
+            # Map filter_status to PostgreSQL status values
+            mapped_status = None
+            if filter_status == "uncompleted":
+                # Show all tasks except completed
+                all_tasks = await asyncio.to_thread(
+                    tm.get_tasks,
+                    user_email=user_email,
+                    status=None
+                )
+                tasks = [t for t in all_tasks if t.get("status") != "completed"]
+            elif filter_status == "completed":
+                tasks = await asyncio.to_thread(
+                    tm.get_tasks,
+                    user_email=user_email,
+                    status="completed"
+                )
+            elif filter_status == "all":
+                tasks = await asyncio.to_thread(
+                    tm.get_tasks,
+                    user_email=user_email,
+                    status=None
+                )
+            else:
+                # Direct map if user passes a concrete status like 'pending'
+                tasks = await asyncio.to_thread(
+                    tm.get_tasks,
+                    user_email=user_email,
+                    status=filter_status
+                )
             
             # Get stats
             stats = await asyncio.to_thread(tm.get_task_stats, user_email)
@@ -6328,11 +6742,18 @@ Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
             # Prepare data for CustomElement
             tasks_data = []
             for task in tasks:
+                # Convert datetime to string for JSON serialization
+                due_date = task.get('due_date')
+                if due_date and isinstance(due_date, datetime):
+                    due_date_str = due_date.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    due_date_str = str(due_date) if due_date else ''
+                
                 tasks_data.append({
                     "id": task['id'],
                     "title": task['title'],
                     "description": task.get('description', ''),
-                    "due_date": task.get('due_date', ''),
+                    "due_date": due_date_str,
                     "priority": task.get('priority', 'medium'),
                     "tags": task.get('tags', []),
                     "is_completed": task.get('is_completed', False),
@@ -6627,12 +7048,13 @@ Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
                 
                 chroma_start = time.time()
                 results = await asyncio.to_thread(
-                    vectorstore._collection.query,
+                    _vectorstore_query,
+                    vectorstore,
                     query_embeddings=[query_vector],
-                    n_results=n_results, 
-                    where=final_where_for_chroma, 
-                    where_document=final_where_doc_for_chroma, 
-                    include=["documents", "metadatas"] 
+                    n_results=n_results,
+                    where=final_where_for_chroma,
+                    where_document=final_where_doc_for_chroma,
+                    include=["documents", "metadatas"]
                 )
                 perf_times['chroma'] = time.time() - chroma_start
                 
@@ -6655,7 +7077,8 @@ Chỉ trả về các tag (1-3 tag), cách nhau bởi dấu phẩy:"""
                         if parent_id and parent_id not in seen_parents:
                             # Query parent document - ChromaDB chỉ cho 1 điều kiện where
                             parent_result = await asyncio.to_thread(
-                                vectorstore._collection.get,
+                                _vectorstore_get,
+                                vectorstore,
                                 where={"parent_id": parent_id},
                                 include=["metadatas"]
                             )
@@ -7864,9 +8287,15 @@ Chỉ trả về 1 số, không giải thích."""
             if not dt_when or not trigger:
                 return f"❌ Lỗi: Không thể phân tích thời gian '{thoi_gian}'"
 
-            # (Logic lưu CSDL và Scheduler)
+            # (Logic lưu CSDL và Scheduler - MIGRATED TO PostgreSQL)
+            import task_manager as tm
             task_id = await asyncio.to_thread(
-                _add_task_to_db, user_id_str, task_text, mo_ta, dt_when, recurrence_rule, None
+                tm.create_task,
+                user_email=user_id_str,
+                title=task_text,
+                description=mo_ta,
+                due_date=dt_when,
+                recurrence_rule=recurrence_rule
             )
             job_id = f"taskpush-{task_id}-{job_id_suffix}"
             
@@ -7882,11 +8311,8 @@ Chỉ trả về 1 số, không giải thích."""
             )
             # --- 🚀 KẾT THÚC SỬA LỖI V90 🚀 ---
             
-            conn = _get_user_db_conn()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE user_tasks SET scheduler_job_id = ? WHERE id = ?", (job_id, task_id))
-            conn.commit()
-            conn.close()
+            # PostgreSQL version: scheduler_job_id được lưu trực tiếp qua APScheduler
+            # Không cần UPDATE thêm
 
             # (Logic tạo FACT giữ nguyên)
             try:
@@ -8791,6 +9217,17 @@ async def on_message(message: cl.Message):
                 TASK_ACK_STATUS[ack_key] = True
                 print(f"[Task ACK] User {user_id_str_esc} đã phản hồi → Ngừng nhắc task #{task_id}")
                 
+                # Cancel all taskpush jobs for this task
+                if SCHEDULER:
+                    try:
+                        jobs = SCHEDULER.get_jobs()
+                        for job in jobs:
+                            if f"taskpush-{task_id}" in job.id or f"taskpush-check-{task_id}" in job.id:
+                                SCHEDULER.remove_job(job.id)
+                                print(f"[Task ACK] Đã hủy job nhắc lại: {job.id}")
+                    except Exception as e_job:
+                        print(f"[Task ACK] Lỗi khi hủy jobs: {e_job}")
+                
         except Exception as e:
             print(f"[Escalation/Task ACK] Lỗi khi ack: {e}")
 
@@ -9229,6 +9666,43 @@ async def on_view_tasks(action: cl.Action):
     except Exception as e:
         await cl.Message(content=f"❌ Lỗi khi load tasks: {e}").send()
         print(f"[Action] Error in view_tasks: {e}")
+
+# Handler cho edit task riêng lẻ (pattern: edit_task_{id})
+@cl.action_callback(name=lambda n: n.startswith("edit_task_"))
+async def on_edit_single_task(action: cl.Action):
+    """Hiển thị popup edit cho 1 task cụ thể."""
+    try:
+        # Extract task_id from action name: "edit_task_123" -> 123
+        task_id = int(action.name.split("_")[-1])
+        
+        import task_manager as tm
+        task = await asyncio.to_thread(tm.get_task_by_id, task_id)
+        
+        if not task:
+            await cl.Message(content=f"❌ Không tìm thấy task #{task_id}").send()
+            return
+        
+        # Tạo CustomElement với TaskGrid (chỉ hiển thị 1 task)
+        grid_html = f"""
+        <link rel="stylesheet" href="/public/elements/TaskGrid.css">
+        <script src="/public/elements/TaskGrid.jsx" type="text/babel"></script>
+        <div id="task-grid-root" data-tasks='[{json.dumps(task)}]'></div>
+        """
+        
+        element = CustomElement(
+            name="TaskEditPopup",
+            content=grid_html,
+            display="inline"
+        )
+        
+        await cl.Message(
+            content=f"✏️ **Chỉnh sửa: {task.get('title', 'Task')}**",
+            elements=[element]
+        ).send()
+        
+    except Exception as e:
+        await cl.Message(content=f"❌ Lỗi: {e}").send()
+        print(f"[Action] Error in edit_single_task: {e}")
 
 @cl.action_callback("new_chat")
 async def on_new_chat(action: cl.Action):

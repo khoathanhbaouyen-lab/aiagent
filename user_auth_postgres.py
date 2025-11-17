@@ -12,7 +12,7 @@ def init_users_table():
     """
     execute_query("""
         CREATE TABLE IF NOT EXISTS app_users (
-            email TEXT PRIMARY KEY,
+            email TEXT PRIMARY KEY, 
             password_hash TEXT NOT NULL,
             name TEXT,
             is_admin INTEGER DEFAULT 0,

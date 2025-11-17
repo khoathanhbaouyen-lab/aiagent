@@ -11,9 +11,8 @@ langchain-chroma
 # Vectorstore DB
 chromadb
 
-# PostgreSQL & pgvector
+# PostgreSQL (NO pgvector extension needed)
 psycopg2-binary
-pgvector
 langchain-postgres
 
 # File Processing

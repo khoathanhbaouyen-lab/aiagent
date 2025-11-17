@@ -1,0 +1,178 @@
+{
+  "ghi chú server thông tin": {
+    "key": "server_thong_tin",
+    "label": "Server Thông Tin"
+  },
+  "file ds 2022": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "file ds 2024": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "file 1": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "file 2": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "may khoan": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "may bao": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "che": {
+    "key": "an_uong",
+    "label": "Ăn Uống"
+  },
+  "ca": {
+    "key": "an_uong",
+    "label": "Ăn Uống"
+  },
+  "an banh": {
+    "key": "an_uong",
+    "label": "Ăn Uống"
+  },
+  "ghi chú server": {
+    "key": "server_thong_tin",
+    "label": "Server Thông Tin"
+  },
+  "server thông tin cong viec": {
+    "key": "server_thong_tin",
+    "label": "Server Thông Tin"
+  },
+  "lưu hình may khoan và máy bao vào công viêc": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "công viêc": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "lưu hình may khoan và máy bao": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "hue_travel_photo": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "lưu ảnh may cat vào cong viec": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "cong viec": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "lưu ảnh may cat": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "luu anh may cat vào cong viec": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "luu anh may cat": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "lưu anh bo dung cụ và máy khoan vào cong viec": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "lưu anh bo dung cụ và máy khoan": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "anh may bao": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "may cat": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "anh du lich vung tau": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "anh du lich phan thiet": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "ảnh du lịch hà nội": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "ảnh du lịch hạ long": {
+    "key": "du_lich",
+    "label": "Du Lịch"
+  },
+  "ảnh máy cắt 1": {
+    "key": "general",
+    "label": "General"
+  },
+  "ảnh máy cắt 2": {
+    "key": "general",
+    "label": "General"
+  },
+  "ảnh bộ dụng cụ": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "ảnh máy bao": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "bài phát biểu gia đình": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "ảnh đi chơi gia đình 1": {
+    "key": "gia_dinh",
+    "label": "Gia Đình"
+  },
+  "ảnh đi chơi gia đình 2": {
+    "key": "gia_dinh",
+    "label": "Gia Đình"
+  },
+  "ảnh cccd của tôi": {
+    "key": "ho_so_ca_nhan",
+    "label": "Hồ Sơ Cá Nhân"
+  },
+  "ghi chú server thông tin cong viec": {
+    "key": "server_thong_tin",
+    "label": "Server Thông Tin"
+  },
+  "server thông tin": {
+    "key": "server_thong_tin",
+    "label": "Server Thông Tin"
+  },
+  "ảnh máy cưa": {
+    "key": "general",
+    "label": "General"
+  },
+  "luu hinh máy chém vào cong viec": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "luu hinh máy chém": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "ảnh máy khoan": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  },
+  "ảnh máy cắt": {
+    "key": "cong_viec",
+    "label": "Công Việc"
+  }
+}

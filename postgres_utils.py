@@ -7,6 +7,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 from dotenv import load_dotenv
+from urllib.parse import quote_plus
 
 load_dotenv()
 
@@ -24,19 +25,25 @@ def get_postgres_connection_string() -> str:
     """
     Tạo PostgreSQL connection string cho SQLAlchemy và các thư viện khác.
     Format: postgresql://user:password@host:port/database
+    URL-encode password để xử lý ký tự đặc biệt (@, :, /, etc.)
     """
-    return f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    # URL-encode password để tránh lỗi với ký tự đặc biệt
+    encoded_password = quote_plus(POSTGRES_PASSWORD) if POSTGRES_PASSWORD else ""
+    return f"postgresql://{POSTGRES_USER}:{encoded_password}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 
 def get_asyncpg_connection_string() -> str:
     """
     Tạo connection string cho asyncpg (dùng bởi langchain-postgres).
     Format: postgresql+asyncpg://user:password@host:port/database
+    URL-encode password để xử lý ký tự đặc biệt.
     """
-    return f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    encoded_password = quote_plus(POSTGRES_PASSWORD) if POSTGRES_PASSWORD else ""
+    return f"postgresql+asyncpg://{POSTGRES_USER}:{encoded_password}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 
-def init_connection_pool(min_conn: int = 1, max_conn: int = 20):
+def init_connection_pool(min_conn: int = 10, max_conn: int = 200):
     """
     Khởi tạo connection pool cho PostgreSQL.
+    Optimized cho 200 concurrent users.
     """
     global _connection_pool
     try:
@@ -47,7 +54,10 @@ def init_connection_pool(min_conn: int = 1, max_conn: int = 20):
             port=POSTGRES_PORT,
             user=POSTGRES_USER,
             password=POSTGRES_PASSWORD,
-            database=POSTGRES_DB
+            database=POSTGRES_DB,
+            # Performance tuning
+            connect_timeout=10,
+            options='-c statement_timeout=30000'  # 30s timeout
         )
         print(f"✅ [PostgreSQL] Connection pool đã khởi tạo (min={min_conn}, max={max_conn})")
     except Exception as e:
@@ -98,7 +108,10 @@ def execute_query(query: str, params: tuple = None, fetch: bool = False):
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(query, params or ())
             if fetch:
-                return cursor.fetchall()
+                result = cursor.fetchall()
+                # IMPORTANT: Commit even when fetching (for INSERT...RETURNING, UPDATE...RETURNING, etc.)
+                conn.commit()
+                return result
             else:
                 conn.commit()
                 return None
@@ -110,18 +123,6 @@ def execute_query(query: str, params: tuple = None, fetch: bool = False):
     finally:
         if conn:
             release_connection(conn)
-
-def init_pgvector_extension():
-    """
-    Khởi tạo pgvector extension trong PostgreSQL.
-    """
-    try:
-        execute_query("CREATE EXTENSION IF NOT EXISTS vector;")
-        print("✅ [PostgreSQL] pgvector extension đã được kích hoạt")
-    except Exception as e:
-        print(f"❌ [PostgreSQL] Lỗi khởi tạo pgvector: {e}")
-        print("⚠️  Đảm bảo bạn đã cài đặt pgvector extension trong PostgreSQL")
-        raise
 
 def test_connection() -> bool:
     """

@@ -451,9 +451,18 @@ def edit_task():
         print(f"  - assigned_to: {assigned_to}")
         print(f"  - recurrence_rule: {recurrence_rule}")
         
+        # Get user_email from existing task (because frontend doesn't send it)
+        existing_task = tm.get_task_by_id(task_id)
+        if not existing_task:
+            return jsonify({"error": "Task not found"}), 404
+        
+        user_email = existing_task.get('user_email', 'default@local')
+        print(f"  - user_email (from DB): {user_email}")
+        
         # Update task
         success = tm.update_task(
             task_id=task_id,
+            user_email=user_email,
             title=title if title else None,
             description=description if description else None,
             due_date=due_date if due_date else None,
@@ -547,9 +556,13 @@ def delete_task():
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import task_manager as tm
         
-        # Get user_email from session (trong thực tế cần auth token)
-        # Tạm thời dùng user_email từ request hoặc default
-        user_email = data.get('user_email', 'default@local')
+        # Get user_email from existing task (because frontend doesn't send it)
+        existing_task = tm.get_task_by_id(task_id)
+        if not existing_task:
+            return jsonify({"error": "Task not found"}), 404
+        
+        user_email = existing_task.get('user_email', 'default@local')
+        print(f"[DEBUG] Deleting task #{task_id} for user {user_email}")
         
         success = tm.delete_task(task_id, user_email)
         
@@ -598,6 +611,39 @@ def complete_task():
         print(f"❌ [API] Lỗi complete_task: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/register-fcm-token', methods=['POST'])
+def register_fcm_token():
+    """API để đăng ký FCM token từ frontend"""
+    try:
+        data = request.json
+        fcm_token = data.get('token')
+        user_email = data.get('user_email', 'default@local')
+        
+        if not fcm_token:
+            return jsonify({"error": "Missing FCM token"}), 400
+        
+        # Connect to users.db
+        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "user_data", "users.sqlite"))
+        cursor = conn.cursor()
+        
+        # Insert or replace FCM token
+        cursor.execute("""
+            INSERT OR REPLACE INTO fcm_tokens (user_email, fcm_token, created_at, updated_at)
+            VALUES (?, ?, datetime('now'), datetime('now'))
+        """, (user_email, fcm_token))
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ [API] Registered FCM token for {user_email}")
+        return jsonify({"success": True, "message": "FCM token registered successfully"})
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [API] Error registering FCM token: {e}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     print("🚀 API Server đang chạy trên http://localhost:8001")
     print("   - DELETE FILE: POST /api/delete-file")
@@ -606,6 +652,7 @@ if __name__ == '__main__':
     print("   - DELETE TASK: POST /api/delete-task")
     print("   - COMPLETE TASK: POST /api/complete-task")
     print("   - GET USERS:   GET  /api/get-users")
+    print("   - REGISTER FCM TOKEN: POST /api/register-fcm-token")
     print()
     
     # Initialize scheduler

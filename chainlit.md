@@ -4,3 +4,4 @@
 - Hỗ trợ ảnh (vision) với GPT-4.1-mini
 
 <script src="/public/mode-toggle.js"></script>
+<script src="/public/notify.js"></script>

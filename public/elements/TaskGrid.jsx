@@ -9,6 +9,13 @@ export default function TaskGrid() {
   const [editForm, setEditForm] = React.useState({});
   const [allUsers, setAllUsers] = React.useState([]);
   const [userSearch, setUserSearch] = React.useState('');
+  const [activeFormTab, setActiveFormTab] = React.useState('general');
+
+  const formTabs = [
+    { id: 'general', label: 'Thông tin' },
+    { id: 'assign', label: 'Giao việc' },
+    { id: 'recurrence', label: 'Lặp lại' }
+  ];
 
   // Load users on mount
   React.useEffect(() => {
@@ -33,48 +40,56 @@ export default function TaskGrid() {
     e.stopPropagation();
     if (!confirm(`Đánh dấu hoàn thành: "${task.title}"?`)) return;
     
-    try {
-      const res = await fetch('http://localhost:8001/api/complete-task', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ task_id: task.id })
-      });
-      
-      if (res.ok) {
-        setTasks(prev => prev.map(t => 
-          t.id === task.id ? {...t, is_completed: true} : t
-        ));
-        alert('✅ Đã hoàn thành!');
-      } else {
-        alert('⚠️ Lỗi khi cập nhật');
-      }
-    } catch (err) {
-      alert('❌ Không thể kết nối server');
-    }
-  };
+      try {
+        const res = await fetch('http://localhost:8001/api/complete-task', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            task_id: task.id,
+            user_email: task.user_email || 'default@local'
+          })
+        });
 
-  const handleDelete = async (task, e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!confirm(`Xóa công việc: "${task.title}"?`)) return;
-    
-    try {
-      const res = await fetch('http://localhost:8001/api/delete-task', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ task_id: task.id })
-      });
-      
-      if (res.ok) {
-        setTasks(prev => prev.filter(t => t.id !== task.id));
-        alert('🗑️ Đã xóa!');
-      } else {
-        alert('⚠️ Lỗi khi xóa');
+        if (res.ok) {
+          setTasks(prev => prev.map(t => (
+            t.id === task.id ? { ...t, status: 'completed', is_completed: 1 } : t
+          )));
+          alert('✅ Đã đánh dấu hoàn thành!');
+        } else {
+          alert('⚠️ Lỗi khi cập nhật trạng thái');
+        }
+      } catch (err) {
+        console.error('complete-task error:', err);
+        alert('❌ Không thể kết nối server');
       }
-    } catch (err) {
-      alert('❌ Không thể kết nối server');
-    }
-  };
+    };
+
+    const handleDelete = async (task, e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!confirm(`Xóa công việc: "${task.title}"?`)) return;
+
+      try {
+        const res = await fetch('http://localhost:8001/api/delete-task', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            task_id: task.id,
+            user_email: task.user_email || 'default@local'
+          })
+        });
+
+        if (res.ok) {
+          setTasks(prev => prev.filter(t => t.id !== task.id));
+          alert('🗑️ Đã xóa!');
+        } else {
+          alert('⚠️ Lỗi khi xóa');
+        }
+      } catch (err) {
+        console.error('delete-task error:', err);
+        alert('❌ Không thể kết nối server');
+      }
+    };
 
   const openEditModal = (task, e) => {
     e.preventDefault();
@@ -221,23 +236,100 @@ export default function TaskGrid() {
 
   return React.createElement('div', { style: { width: '100%', padding: '20px 0' } }, [
     React.createElement('style', { key: 's' }, `
+      .tg-modal {
+        background: rgba(255,255,255,0.65);
+        border-radius: 20px;
+        padding: 28px;
+        max-width: 1000px;
+        width: min(95vw, 1000px);
+        max-height: 85vh;
+        overflow-y: auto;
+        box-shadow: 0 30px 80px rgba(15,23,42,0.35);
+        backdrop-filter: blur(18px);
+        border: 1px solid rgba(255,255,255,0.4);
+      }
+      .tg-modal-title {
+        font-size: 20px;
+        font-weight: 700;
+        margin-bottom: 20px;
+        color: #1f2937;
+      }
+      .tg-desktop-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+      .tg-form-group {
+        margin-bottom: 16px;
+        background: rgba(255,255,255,0.55);
+        border: 1px solid rgba(255,255,255,0.35);
+        border-radius: 14px;
+        padding: 12px 14px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 12px 35px rgba(148,163,184,0.18);
+      }
+      .tg-span-2 { grid-column: span 2; }
+      .tg-span-3 { grid-column: span 3; }
+      .tg-mobile-tabs { display: none; }
+      @media (max-width: 1024px) {
+        .tg-desktop-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 768px) {
+        .tg-desktop-grid { display: none; }
+        .tg-mobile-tabs { display: block; }
+        .tg-form-group { margin-bottom: 14px; }
+      }
+      .tg-tab-buttons {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+      .tg-tab-button {
+        flex: 1;
+        padding: 10px;
+        border-radius: 12px;
+        border: 1px solid transparent;
+        background: rgba(15,23,42,0.08);
+        color: #1f2937;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+      .tg-tab-button.active {
+        background: rgba(59,130,246,0.2);
+        border-color: rgba(59,130,246,0.45);
+        color: #1d4ed8;
+      }
       .tg-stats {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
-        gap: 15px;
-        margin-bottom: 20px;
+        gap: 16px;
+        margin-bottom: 24px;
       }
       .tg-stat-card {
-        padding: 15px;
-        border-radius: 12px;
-        color: white;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        padding: 20px;
+        border-radius: 16px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
       }
-      .tg-stat-label { font-size: 12px; opacity: 0.9; margin-bottom: 5px; }
-      .tg-stat-value { font-size: 24px; font-weight: bold; }
-      
+      .tg-stat-label {
+        font-size: 13px;
+        font-weight: 700;
+        color: white;
+        margin-bottom: 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      .tg-stat-value {
+        font-size: 32px;
+        font-weight: 700;
+        color: white;
+      }
+      @media (max-width: 768px) {
+        .tg-stats {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
       .tg-table {
-        width: 100%;
         border-collapse: collapse;
         background: white;
         border-radius: 12px;
@@ -330,8 +422,10 @@ export default function TaskGrid() {
         background: white;
         border-radius: 12px;
         padding: 24px;
-        max-width: 500px;
+        max-width: 1000px;
         width: 90%;
+        max-height: 85vh;
+        overflow-y: auto;
         box-shadow: 0 20px 60px rgba(0,0,0,0.3);
       }
       .tg-modal-title {
@@ -339,6 +433,16 @@ export default function TaskGrid() {
         font-weight: 700;
         margin-bottom: 20px;
         color: #1f2937;
+      }
+      .tg-form-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      @media (max-width: 768px) {
+        .tg-form-row {
+          grid-template-columns: 1fr;
+        }
       }
       .tg-form-group {
         margin-bottom: 16px;
@@ -554,7 +658,10 @@ export default function TaskGrid() {
             React.createElement('td', { key: 'due' }, task.due_date || '-'),
             React.createElement('td', { key: 'assign', style: { fontSize: '12px' } }, 
               task.assigned_to 
-                ? task.assigned_to.split(',').map(email => email.split('@')[0]).join(', ')
+                ? task.assigned_to.split(',').map(email => {
+                    const user = allUsers.find(u => u.email === email.trim());
+                    return user ? user.name : email.split('@')[0];
+                  }).join(', ')
                 : '-'
             ),
             React.createElement('td', { key: 'recur', style: { fontSize: '12px' } }, recurDisplay),
@@ -584,13 +691,15 @@ export default function TaskGrid() {
                 !task.is_completed && React.createElement('button', {
                   className: 'tg-btn tg-btn-complete',
                   onClick: (e) => handleComplete(task, e),
-                  key: 'complete'
-                }, '✅'),
+                  key: 'complete',
+                  style: { background: '#10b981', color: 'white', display: 'flex', alignItems: 'center', gap: '4px' }
+                }, [React.createElement('span', { key: 'icon', style: { filter: 'brightness(0) invert(1)' } }, '✓'), 'Hoàn thành']),
                 React.createElement('button', {
                   className: 'tg-btn tg-btn-delete',
                   onClick: (e) => handleDelete(task, e),
-                  key: 'delete'
-                }, '🗑️')
+                  key: 'delete',
+                  style: { background: '#ef4444', color: 'white', display: 'flex', alignItems: 'center', gap: '4px' }
+                }, [React.createElement('span', { key: 'icon', style: { filter: 'brightness(0) invert(1)' } }, '🗑'), 'Xóa'])
               ])
             )
           ]);
@@ -612,35 +721,71 @@ export default function TaskGrid() {
           `✏️ Sửa công việc #${editModal.id}`
         ),
         React.createElement('form', { onSubmit: handleEditSubmit, key: 'form' }, [
-          React.createElement('div', { className: 'tg-form-group', key: 'title' }, [
-            React.createElement('label', { className: 'tg-form-label', key: 'l' }, '📝 Tiêu đề'),
-            React.createElement('input', {
-              className: 'tg-form-input',
-              type: 'text',
-              value: editForm.title,
-              onChange: (e) => setEditForm({...editForm, title: e.target.value}),
-              key: 'i'
-            })
+          // Row 1: Title + Due Date
+          React.createElement('div', { className: 'tg-form-row', key: 'row1' }, [
+            React.createElement('div', { className: 'tg-form-group', key: 'title' }, [
+              React.createElement('label', { className: 'tg-form-label', key: 'l' }, '📝 Tiêu đề'),
+              React.createElement('input', {
+                className: 'tg-form-input',
+                type: 'text',
+                value: editForm.title,
+                onChange: (e) => setEditForm({...editForm, title: e.target.value}),
+                key: 'i'
+              })
+            ]),
+            React.createElement('div', { className: 'tg-form-group', key: 'due' }, [
+              React.createElement('label', { className: 'tg-form-label', key: 'l' }, '⏰ Thời hạn (Ngày & Giờ)'),
+              React.createElement('input', {
+                className: 'tg-form-input',
+                type: 'datetime-local',
+                value: editForm.due_date,
+                onChange: (e) => setEditForm({...editForm, due_date: e.target.value}),
+                key: 'i'
+              })
+            ])
           ]),
+          
+          // Row 2: Description (full width)
           React.createElement('div', { className: 'tg-form-group', key: 'desc' }, [
             React.createElement('label', { className: 'tg-form-label', key: 'l' }, '📄 Mô tả'),
             React.createElement('textarea', {
               className: 'tg-form-textarea',
               value: editForm.description,
               onChange: (e) => setEditForm({...editForm, description: e.target.value}),
+              style: { minHeight: '60px' },
               key: 'i'
             })
           ]),
-          React.createElement('div', { className: 'tg-form-group', key: 'due' }, [
-            React.createElement('label', { className: 'tg-form-label', key: 'l' }, '⏰ Thời hạn (Ngày & Giờ)'),
-            React.createElement('input', {
-              className: 'tg-form-input',
-              type: 'datetime-local',
-              value: editForm.due_date,
-              onChange: (e) => setEditForm({...editForm, due_date: e.target.value}),
-              key: 'i'
-            })
+          
+          // Row 3: Priority + Tags
+          React.createElement('div', { className: 'tg-form-row', key: 'row3' }, [
+            React.createElement('div', { className: 'tg-form-group', key: 'priority' }, [
+              React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🎯 Priority'),
+              React.createElement('select', {
+                className: 'tg-form-select',
+                value: editForm.priority,
+                onChange: (e) => setEditForm({...editForm, priority: e.target.value}),
+                key: 'i'
+              }, [
+                React.createElement('option', { value: 'low', key: 'low' }, 'LOW'),
+                React.createElement('option', { value: 'medium', key: 'med' }, 'MEDIUM'),
+                React.createElement('option', { value: 'high', key: 'high' }, 'HIGH')
+              ])
+            ]),
+            React.createElement('div', { className: 'tg-form-group', key: 'tags' }, [
+              React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🏷️ Tags (cách nhau bởi dấu phẩy)'),
+              React.createElement('input', {
+                className: 'tg-form-input',
+                type: 'text',
+                value: editForm.tags,
+                onChange: (e) => setEditForm({...editForm, tags: e.target.value}),
+                placeholder: 'work, urgent, meeting',
+                key: 'i'
+              })
+            ])
           ]),
+          
+          // Row 4: Assign Users (full width)
           React.createElement('div', { className: 'tg-form-group', key: 'assign' }, [
             React.createElement('label', { className: 'tg-form-label', key: 'l' }, '👥 Giao cho (Multi-select)'),
             React.createElement('div', { 
@@ -702,69 +847,37 @@ export default function TaskGrid() {
                 })
               )
           ]),
-          React.createElement('div', { className: 'tg-form-group', key: 'priority' }, [
-            React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🎯 Priority'),
-            React.createElement('select', {
-              className: 'tg-form-select',
-              value: editForm.priority,
-              onChange: (e) => setEditForm({...editForm, priority: e.target.value}),
-              key: 'i'
-            }, [
-              React.createElement('option', { value: 'low', key: 'low' }, 'LOW'),
-              React.createElement('option', { value: 'medium', key: 'med' }, 'MEDIUM'),
-              React.createElement('option', { value: 'high', key: 'high' }, 'HIGH')
-            ])
-          ]),
-          React.createElement('div', { className: 'tg-form-group', key: 'tags' }, [
-            React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🏷️ Tags (cách nhau bởi dấu phẩy)'),
-            React.createElement('input', {
-              className: 'tg-form-input',
-              type: 'text',
-              value: editForm.tags,
-              onChange: (e) => setEditForm({...editForm, tags: e.target.value}),
-              placeholder: 'work, urgent, meeting',
-              key: 'i'
-            })
-          ]),
           
-          // Recurrence Type (Repeat vs Remind)
-          React.createElement('div', { className: 'tg-form-group', key: 'recur-type' }, [
-            React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🔔 Loại lặp lại'),
-            React.createElement('div', { 
-              style: { fontSize: '11px', color: '#6b7280', marginBottom: '6px' }, 
-              key: 'help' 
-            }, 'Chọn giữa Lặp lại (tạo task mới) hoặc Nhắc lại (chỉ thông báo)'),
-            React.createElement('select', {
-              className: 'tg-form-select',
-              value: editForm.recurrence_type || 'repeat',
-              onChange: (e) => setEditForm({...editForm, recurrence_type: e.target.value}),
-              key: 'i'
-            }, [
-              React.createElement('option', { value: 'repeat', key: '1' }, '🔁 Lặp lại (Tạo task mới mỗi lần)'),
-              React.createElement('option', { value: 'remind', key: '2' }, '🔔 Nhắc lại (Chỉ thông báo, không tạo task mới)')
-            ])
-          ]),
-          
-          // Recurring Rule
-          React.createElement('div', { className: 'tg-form-group', key: 'recur' }, [
-            React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🔁 Tần suất lặp lại'),
-            React.createElement('div', { 
-              style: { fontSize: '11px', color: '#6b7280', marginBottom: '6px' }, 
-              key: 'help' 
-            }, 'Công việc sẽ tự động lặp lại theo tần suất bạn chọn'),
-            React.createElement('select', {
-              className: 'tg-form-select',
-              value: editForm.recurrence_freq,
-              onChange: (e) => setEditForm({...editForm, recurrence_freq: e.target.value}),
-              key: 'i'
-            }, [
-              React.createElement('option', { value: 'once', key: '1' }, '⚪ Một lần (Không lặp)'),
-              React.createElement('option', { value: 'minutely', key: '2' }, '⏱️ Theo phút'),
-              React.createElement('option', { value: 'hourly', key: '3' }, '🕐 Theo giờ'),
-              React.createElement('option', { value: 'daily', key: '4' }, '📅 Hàng ngày'),
-              React.createElement('option', { value: 'weekly', key: '5' }, '📆 Hàng tuần'),
-              React.createElement('option', { value: 'monthly', key: '6' }, '📊 Hàng tháng'),
-              React.createElement('option', { value: 'yearly', key: '7' }, '🗓️ Hàng năm')
+          // Row 5: Recurrence Type + Frequency
+          React.createElement('div', { className: 'tg-form-row', key: 'row5' }, [
+            React.createElement('div', { className: 'tg-form-group', key: 'recur-type' }, [
+              React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🔔 Loại lặp lại'),
+              React.createElement('select', {
+                className: 'tg-form-select',
+                value: editForm.recurrence_type || 'repeat',
+                onChange: (e) => setEditForm({...editForm, recurrence_type: e.target.value}),
+                key: 'i'
+              }, [
+                React.createElement('option', { value: 'repeat', key: '1' }, '🔁 Lặp lại (Tạo task mới)'),
+                React.createElement('option', { value: 'remind', key: '2' }, '🔔 Nhắc lại (Chỉ thông báo)')
+              ])
+            ]),
+            React.createElement('div', { className: 'tg-form-group', key: 'recur' }, [
+              React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🔁 Tần suất lặp lại'),
+              React.createElement('select', {
+                className: 'tg-form-select',
+                value: editForm.recurrence_freq,
+                onChange: (e) => setEditForm({...editForm, recurrence_freq: e.target.value}),
+                key: 'i'
+              }, [
+                React.createElement('option', { value: 'once', key: '1' }, '⚪ Một lần'),
+                React.createElement('option', { value: 'minutely', key: '2' }, '⏱️ Theo phút'),
+                React.createElement('option', { value: 'hourly', key: '3' }, '🕐 Theo giờ'),
+                React.createElement('option', { value: 'daily', key: '4' }, '📅 Hàng ngày'),
+                React.createElement('option', { value: 'weekly', key: '5' }, '📆 Hàng tuần'),
+                React.createElement('option', { value: 'monthly', key: '6' }, '📊 Hàng tháng'),
+                React.createElement('option', { value: 'yearly', key: '7' }, '🗓️ Hàng năm')
+              ])
             ])
           ]),
           
