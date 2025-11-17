@@ -33,14 +33,22 @@ sudo apt install -y postgresql-17 postgresql-contrib-17
 # 4. Install pgvector extension
 echo "📊 [4/8] Installing pgvector extension..."
 sudo apt install -y postgresql-server-dev-17 build-essential git
+
+# Start PostgreSQL first (needed for pg_config)
+sudo systemctl start postgresql
+
+# Set PostgreSQL path
+export PATH=/usr/lib/postgresql/17/bin:$PATH
+
 cd /tmp
-if [ ! -d "pgvector" ]; then
-    git clone https://github.com/pgvector/pgvector.git
+if [ -d "pgvector" ]; then
+    rm -rf pgvector
 fi
+git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git
 cd pgvector
 make clean
-make OPTFLAGS=""
-sudo make install
+make PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
+sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
 cd -
 
 # 5. Setup PostgreSQL
