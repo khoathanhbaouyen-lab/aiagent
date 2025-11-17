@@ -65,7 +65,8 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 
 GLOBAL_MESSAGE_QUEUE: Optional[Queue] = None   # "Tổng đài" (chỉ 1)
 ACTIVE_SESSION_QUEUES = {}                     # (SỬA) { user_id_str: [queue1, queue2] }
-POLLER_STARTED = False                         # Cờ để khởi động Tổng đài (1 lần)                      # Cờ để khởi động Tổng đài (1 lần)
+POLLER_STARTED = False                         # Cờ để khởi động Tổng đài (1 lần)
+NOTIFICATION_POLLER_STARTED = False            # Cờ để khởi động Task Notification Poller (1 lần)                      # Cờ để khởi động Tổng đài (1 lần)
 # =========================================================
 # 📦 Env
 # =========================================================
@@ -163,6 +164,9 @@ except Exception as e:
 
 # Theo dõi các “escalating reminders” đang chạy theo từng session
 ACTIVE_ESCALATIONS = {}  # { internal_session_id: { "repeat_job_id": str, "acked": bool } }
+
+# Theo dõi task notifications đã được acknowledge (để ngừng nhắc lại)
+TASK_ACK_STATUS = {}  # { "user_email:task_id": True/False }
 
 # =========================================================
 #  V108: DATA LAYER - CHAT HISTORY (MIGRATED TO PostgreSQL)
@@ -472,7 +476,7 @@ async def on_start_after_login():
     print(f"✅ VectorStore cho user '{user_email}' đã sẵn sàng (mode=Similarity K=100)")
     
     # 2. Khởi tạo Tổng đài (như cũ)
-    global GLOBAL_MESSAGE_QUEUE, POLLER_STARTED
+    global GLOBAL_MESSAGE_QUEUE, POLLER_STARTED, NOTIFICATION_POLLER_STARTED
     if GLOBAL_MESSAGE_QUEUE is None:
         try:
             GLOBAL_MESSAGE_QUEUE = asyncio.Queue()
@@ -487,37 +491,78 @@ async def on_start_after_login():
             print("✅ [Global] Đã khởi động TỔNG ĐÀI (Broadcaster).")
         except Exception as e:
             print(f"❌ [Global] Lỗi khởi động Tổng đài: {e}")
+    
+    if not NOTIFICATION_POLLER_STARTED:
+        try:
+            asyncio.create_task(task_notification_poller())
+            NOTIFICATION_POLLER_STARTED = True
+            print("✅ [Global] Đã khởi động TASK NOTIFICATION POLLER.")
+        except Exception as e:
+            print(f"❌ [Global] Lỗi khởi động Task Notification Poller: {e}")
 
-    # 3. Hiển thị TaskList khi khởi động
-    task_list = cl.TaskList()
-    task_list.status = "Đang khởi tạo..."
-    
-    task1 = cl.Task(title="Kết nối Database", status=cl.TaskStatus.RUNNING)
-    await task_list.add_task(task1)
-    
-    task2 = cl.Task(title="Load VectorStore", status=cl.TaskStatus.READY)
-    await task_list.add_task(task2)
-    
-    task3 = cl.Task(title="Khởi tạo Agent", status=cl.TaskStatus.READY)
-    await task_list.add_task(task3)
-    
-    await task_list.send()
-    
-    # Simulate progress
-    await asyncio.sleep(0.5)
-    task1.status = cl.TaskStatus.DONE
-    task2.status = cl.TaskStatus.RUNNING
-    await task_list.send()
-    
-    await asyncio.sleep(0.5)
-    task2.status = cl.TaskStatus.DONE
-    task3.status = cl.TaskStatus.RUNNING
-    await task_list.send()
-    
-    await asyncio.sleep(0.5)
-    task3.status = cl.TaskStatus.DONE
-    task_list.status = "✅ Sẵn sàng"
-    await task_list.send()
+    # 3. Hiển thị danh sách task thực từ database
+    try:
+        user_email = user.identifier.lower()
+        import task_manager as tm
+        
+        # Lấy tasks sắp đến hạn (7 ngày tới)
+        from datetime import datetime, timedelta
+        start_date = datetime.now(VN_TZ).strftime("%Y-%m-%d")
+        end_date = (datetime.now(VN_TZ) + timedelta(days=7)).strftime("%Y-%m-%d")
+        
+        upcoming_tasks = await asyncio.to_thread(
+            tm.get_tasks,
+            user_email=user_email,
+            status="pending",
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        if upcoming_tasks:
+            task_list = cl.TaskList()
+            task_list.status = f"📋 Công việc sắp đến hạn ({len(upcoming_tasks)})"
+            
+            for task in upcoming_tasks[:5]:  # Chỉ hiển thị 5 task đầu
+                due_date = task.get('due_date', '')
+                priority = task.get('priority', 'medium')
+                task_id = task.get('id')
+                
+                # Format due date
+                try:
+                    from datetime import datetime
+                    dt = datetime.strptime(due_date, '%Y-%m-%d %H:%M:%S')
+                    due_str = dt.strftime('%d/%m %H:%M')
+                except:
+                    due_str = due_date[:16] if due_date else 'N/A'
+                
+                # Icon theo priority
+                icon_map = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+                icon = icon_map.get(priority, '⚪')
+                
+                # Tạo action để mở popup edit task
+                cl_task = cl.Task(
+                    title=f"{icon} {task['title']} • {due_str}",
+                    status=cl.TaskStatus.READY,
+                    forId=f"task_{task_id}"  # ID để click vào sẽ trigger action
+                )
+                await task_list.add_task(cl_task)
+            
+            await task_list.send()
+            print(f"✅ [TaskList] Hiển thị {len(upcoming_tasks[:5])} tasks sắp đến hạn")
+        else:
+            print("ℹ️ [TaskList] Không có task sắp đến hạn")
+        
+        # Gửi message với button để xem/edit tasks (LUÔN hiển thị)
+        actions = [
+            cl.Action(name="view_tasks", label="📋 Xem & Edit Tasks", payload={"action": "view_tasks"})
+        ]
+        await cl.Message(
+            content="💡 _Click nút bên dưới để xem chi tiết và chỉnh sửa công việc_",
+            actions=actions
+        ).send()
+            
+    except Exception as e:
+        print(f"⚠️ [TaskList] Lỗi khi load tasks: {e}")
     
     # 4. Gọi hàm setup chat chính
     await setup_chat_session(user)
@@ -3878,6 +3923,131 @@ async def global_broadcaster_poller():
         except Exception as e:
             print(f"[Tổng đài/ERROR] Bị lỗi: {e}")
             await asyncio.sleep(2)
+
+async def task_notification_poller():
+    """
+    (MỚI) HÀM TASK NOTIFICATION POLLER - Đọc notification_queue và gửi đến users.
+    Chạy 1 lần duy nhất cho toàn hệ thống.
+    """
+    global TASK_ACK_STATUS
+    print("✅ [Task Notification] Task Notification Poller đã khởi động.")
+    
+    # Path to user database containing notification_queue
+    user_db_path = os.path.join(BASE_DIR, "user_data", "users.sqlite")
+    
+    # Initialize notification_queue table if not exists
+    try:
+        conn = sqlite3.connect(user_db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notification_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_email TEXT NOT NULL,
+                task_id INTEGER NOT NULL,
+                task_title TEXT NOT NULL,
+                task_description TEXT,
+                notification_type TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sent INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("✅ [Task Notification] notification_queue table initialized.")
+    except Exception as e:
+        print(f"❌ [Task Notification] Error initializing table: {e}")
+    
+    while True:
+        try:
+            await asyncio.sleep(5)  # Poll every 5 seconds
+            
+            # Query pending notifications
+            conn = sqlite3.connect(user_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT id, user_email, task_id, task_title, task_description, notification_type, created_at
+                FROM notification_queue
+                WHERE sent = 0
+                ORDER BY created_at ASC
+                LIMIT 50
+            """)
+            
+            notifications = cursor.fetchall()
+            
+            if notifications:
+                print(f"[Task Notification] Found {len(notifications)} pending notifications.")
+            
+            for notif in notifications:
+                notif_id = notif['id']
+                user_email = notif['user_email'].lower()
+                task_id = notif['task_id']
+                task_title = notif['task_title']
+                task_description = notif['task_description']
+                notification_type = notif['notification_type']
+                created_at = notif['created_at']
+                
+                # Check if task has been acknowledged
+                ack_key = f"{user_email}:{task_id}"
+                if TASK_ACK_STATUS.get(ack_key):
+                    # User đã phản hồi → Xóa notification và bỏ qua
+                    cursor.execute("UPDATE notification_queue SET sent = 1 WHERE id = ?", (notif_id,))
+                    conn.commit()
+                    print(f"⏭️ [Task Notification] Task #{task_id} đã ACK bởi {user_email}, bỏ qua notification #{notif_id}")
+                    continue
+                
+                # Check if user has active sessions
+                queues_for_user = ACTIVE_SESSION_QUEUES.get(user_email, [])
+                
+                if queues_for_user:
+                    # Build notification message
+                    if notification_type == "REMIND":
+                        icon = "🔔"
+                        title_text = "Nhắc nhở công việc"
+                    else:  # REPEAT
+                        icon = "🔁"
+                        title_text = "Công việc lặp lại"
+                    
+                    content = f"{icon} **{title_text}**\n\n"
+                    content += f"**{task_title}**\n\n"
+                    if task_description:
+                        content += f"_{task_description}_\n\n"
+                    content += f"⏰ _Thời gian: {created_at}_"
+                    
+                    # Send to all active sessions of this user
+                    msg_data = {
+                        "target_user_id": user_email,
+                        "author": "Hệ thống",
+                        "content": content
+                    }
+                    
+                    print(f"[Task Notification] Sending notification #{notif_id} to {user_email} ({len(queues_for_user)} tabs)")
+                    
+                    for target_queue in queues_for_user:
+                        if target_queue:
+                            try:
+                                await target_queue.put(msg_data)
+                            except Exception as e:
+                                print(f"❌ [Task Notification] Error sending to queue: {e}")
+                    
+                    # Mark as sent
+                    cursor.execute("UPDATE notification_queue SET sent = 1 WHERE id = ?", (notif_id,))
+                    conn.commit()
+                    print(f"✅ [Task Notification] Notification #{notif_id} marked as sent.")
+                else:
+                    # User not online, leave notification in queue
+                    print(f"⏳ [Task Notification] User {user_email} not online, notification #{notif_id} queued.")
+            
+            conn.close()
+            
+        except asyncio.CancelledError:
+            print("[Task Notification] Đã dừng.")
+            break
+        except Exception as e:
+            print(f"[Task Notification/ERROR] Bị lỗi: {e}")
+            traceback.print_exc()
+            await asyncio.sleep(5)
 
 async def session_receiver_poller():
     """(MỚI) HÀM THUÊ BAO - Chạy 1 lần cho MỖI TAB."""
@@ -8597,13 +8767,32 @@ async def on_message(message: cl.Message):
         print(f"[on_message] User={user_id_str} Session={session_id} text={text!r}")
         chat_history = cl.user_session.get("chat_history", []) 
         try:
+            global TASK_ACK_STATUS
             user_id_str_esc = cl.user_session.get("user_id_str")
+            # 1. ACK escalation (logic cũ)
             if user_id_str_esc in ACTIVE_ESCALATIONS:
                 if not ACTIVE_ESCALATIONS[user_id_str_esc].get("acked"):
                     ACTIVE_ESCALATIONS[user_id_str_esc]["acked"] = True
                     print(f"[Escalation] ACK dừng leo thang cho USER {user_id_str_esc}")
+            
+            # 2. ACK tất cả task notifications của user (logic mới)
+            user_db_path = os.path.join(BASE_DIR, "user_data", "users.sqlite")
+            conn = sqlite3.connect(user_db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT task_id FROM notification_queue 
+                WHERE user_email = ? AND sent = 0
+            """, (user_id_str_esc,))
+            pending_tasks = cursor.fetchall()
+            conn.close()
+            
+            for (task_id,) in pending_tasks:
+                ack_key = f"{user_id_str_esc}:{task_id}"
+                TASK_ACK_STATUS[ack_key] = True
+                print(f"[Task ACK] User {user_id_str_esc} đã phản hồi → Ngừng nhắc task #{task_id}")
+                
         except Exception as e:
-            print(f"[Escalation] Lỗi khi ack: {e}")
+            print(f"[Escalation/Task ACK] Lỗi khi ack: {e}")
 
         # ----- 3) LOGIC XỬ LÝ (MỚI - V95) -----
         ai_output = None
@@ -9011,6 +9200,36 @@ async def on_toggle_mode(action: cl.Action):
         content=f"{emoji} **Đã chuyển sang mode: {new_mode}**\n\n{desc}"
     ).send()
 
+@cl.action_callback("view_tasks")
+async def on_view_tasks(action: cl.Action):
+    """Hiển thị TaskGrid để xem và edit tasks."""
+    try:
+        import task_manager as tm
+        user_email = cl.user_session.get("user_email")
+        tasks = await asyncio.to_thread(tm.get_tasks, user_email=user_email, status="pending")
+        
+        # Tạo CustomElement với TaskGrid
+        grid_html = f"""
+        <link rel="stylesheet" href="/public/elements/TaskGrid.css">
+        <script src="/public/elements/TaskGrid.jsx" type="text/babel"></script>
+        <div id="task-grid-root" data-tasks='{json.dumps(tasks)}'></div>
+        """
+        
+        element = CustomElement(
+            name="TaskGrid",
+            content=grid_html,
+            display="inline"
+        )
+        
+        await cl.Message(
+            content=f"✅ Đã hiển thị {len(tasks)} công việc trong grid tương tác",
+            elements=[element]
+        ).send()
+        
+    except Exception as e:
+        await cl.Message(content=f"❌ Lỗi khi load tasks: {e}").send()
+        print(f"[Action] Error in view_tasks: {e}")
+
 @cl.action_callback("new_chat")
 async def on_new_chat(action: cl.Action):
     """Yêu cầu người dùng tải lại trang."""
@@ -9115,3 +9334,4 @@ async def on_load_specific_session(action: cl.Action):
     
     new_elements_list = [loading_msg] + replayed_elements
     cl.user_session.set("elements", new_elements_list)
+

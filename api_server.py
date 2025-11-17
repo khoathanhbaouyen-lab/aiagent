@@ -1,6 +1,6 @@
 # api_server.py
 # Mini HTTP API Server để xử lý DELETE/EDIT từ CustomElements
-# Chạy song song với Chainlit trên port 8001
+# Chạy song song với Chainlit trên port config từ .env
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -12,9 +12,16 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 import pytz
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)  # Cho phép CORS để CustomElement có thể gọi
+
+# Port configuration from .env
+API_SERVER_PORT = int(os.getenv("API_SERVER_PORT", "8001"))
 
 # APScheduler instance
 SCHEDULER = None
@@ -100,17 +107,75 @@ def task_reminder_job(task_id, recur_type):
     """Job callback khi đến hạn task"""
     print(f"⏰ [Scheduler] Task #{task_id} triggered (type: {recur_type})")
     
-    # TODO: Gửi notification tới user (qua Chainlit hoặc push notification)
-    # Nếu TYPE:REPEAT → Tạo task mới
-    # Nếu TYPE:REMIND → Chỉ gửi thông báo
-    
-    if recur_type == 'REPEAT':
-        print(f"🔁 [Scheduler] Creating new task from #{task_id}")
-        # Clone task with new due_date
-        # tm.create_task(...)
-    else:
-        print(f"🔔 [Scheduler] Sending reminder for task #{task_id}")
-        # Just notify, don't create new task
+    try:
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import task_manager as tm
+        
+        # Get task info
+        conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), "user_data", "users.sqlite"))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM user_tasks WHERE id = ?", (task_id,))
+        task = cursor.fetchone()
+        
+        if not task:
+            conn.close()
+            print(f"⚠️ [Scheduler] Task #{task_id} not found")
+            return
+        
+        # Create notification queue table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notification_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_email TEXT NOT NULL,
+                task_id INTEGER NOT NULL,
+                task_title TEXT NOT NULL,
+                task_description TEXT,
+                notification_type TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sent INTEGER DEFAULT 0
+            )
+        """)
+        
+        # Insert notification for task owner
+        user_email = task['user_email']
+        cursor.execute("""
+            INSERT INTO notification_queue (user_email, task_id, task_title, task_description, notification_type)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_email, task_id, task['title'], task['description'] or '', recur_type))
+        
+        # Insert notification for assigned users
+        assigned_to = task['assigned_to']
+        if assigned_to:
+            for email in assigned_to.split(','):
+                email = email.strip()
+                if email and email != user_email:
+                    cursor.execute("""
+                        INSERT INTO notification_queue (user_email, task_id, task_title, task_description, notification_type)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (email, task_id, task['title'], task['description'] or '', recur_type))
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ [Scheduler] Notification queued for task #{task_id} (type: {recur_type})")
+        
+        if recur_type == 'REPEAT':
+            print(f"🔁 [Scheduler] Creating new task from #{task_id}")
+            # Clone task with new due_date based on recurrence
+            if task['recurrence_rule']:
+                # Parse next due date from RRULE
+                # For now, just log
+                print(f"   → Would create new task based on RRULE: {task['recurrence_rule']}")
+        else:
+            print(f"🔔 [Scheduler] Reminder only (no new task)")
+            
+    except Exception as e:
+        print(f"❌ [Scheduler] Error in task_reminder_job: {e}")
+        import traceback
+        traceback.print_exc()
 
 @app.route('/api/delete-file', methods=['POST'])
 def delete_file():
@@ -327,6 +392,35 @@ def get_users():
         print(f"❌ [API] Lỗi get_users: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/scheduler/jobs', methods=['GET'])
+def get_scheduler_jobs():
+    """API để xem danh sách jobs trong scheduler"""
+    try:
+        if not SCHEDULER:
+            return jsonify({"error": "Scheduler not initialized"}), 500
+        
+        jobs = []
+        for job in SCHEDULER.get_jobs():
+            jobs.append({
+                'id': job.id,
+                'name': job.name,
+                'next_run_time': str(job.next_run_time) if job.next_run_time else None,
+                'trigger': str(job.trigger)
+            })
+        
+        return jsonify({
+            "success": True, 
+            "scheduler_running": SCHEDULER.running,
+            "jobs_count": len(jobs),
+            "jobs": jobs
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"❌ [API] Lỗi get_scheduler_jobs: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/edit-task', methods=['POST'])
 def edit_task():
     """API để sửa task từ TaskGrid"""
@@ -415,8 +509,16 @@ def edit_task():
                             args=[task_id, recur_type],
                             replace_existing=True
                         )
-                        print(f"✅ [Scheduler] Added job: {job_id} with trigger: {trigger}")
+                        next_run = SCHEDULER.get_job(job_id).next_run_time if SCHEDULER.get_job(job_id) else None
+                        print(f"✅ [Scheduler] Added job: {job_id}")
+                        print(f"   → Trigger: {trigger}")
+                        print(f"   → Type: {recur_type}")
+                        print(f"   → Next run: {next_run}")
+                    else:
+                        print(f"⚠️ [Scheduler] No trigger created for RRULE: {recurrence_rule}")
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"⚠️ [Scheduler] Failed to update: {e}")
             
             return jsonify({"success": True, "message": f"Đã cập nhật task #{task_id}"})
@@ -508,7 +610,7 @@ if __name__ == '__main__':
     
     # Initialize scheduler
     init_scheduler()
-    print("✅ Scheduler initialized and ready")
+    print(f"✅ [API] Server khởi động trên port {API_SERVER_PORT}")
     print()
     
-    app.run(host='0.0.0.0', port=8001, debug=False)
+    app.run(host='0.0.0.0', port=API_SERVER_PORT, debug=False)

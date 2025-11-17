@@ -6,6 +6,13 @@ import sys
 import time
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+API_SERVER_PORT = os.getenv("API_SERVER_PORT", "8001")
+CHAINLIT_PORT = os.getenv("CHAINLIT_PORT", "8000")
 
 def start_api_server():
     """Khởi động API server trong subprocess"""
@@ -14,7 +21,7 @@ def start_api_server():
         print("⚠️ Không tìm thấy api_server.py, bỏ qua...")
         return None
     
-    print("🚀 Khởi động API Server (port 8001)...")
+    print(f"🚀 Khởi động API Server (port {API_SERVER_PORT})...")
     
     # Khởi động API server với CREATE_NEW_CONSOLE để có terminal riêng
     if sys.platform == 'win32':
@@ -52,7 +59,7 @@ def main():
     api_process = start_api_server()
     
     # 2. Khởi động Chainlit
-    print("🚀 Khởi động Chainlit (port 8000)...")
+    print(f"🚀 Khởi động Chainlit (port {CHAINLIT_PORT})...")
     print("=" * 50)
     print()
     
@@ -62,7 +69,7 @@ def main():
         
         # Chạy Chainlit với watch mode
         subprocess.run([
-            sys.executable, "-m", "chainlit", "run", str(app_path), "-w"
+            sys.executable, "-m", "chainlit", "run", str(app_path), "-w", "--port", CHAINLIT_PORT
         ])
         
     except KeyboardInterrupt:

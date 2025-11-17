@@ -8,6 +8,7 @@ export default function TaskGrid() {
   const [editModal, setEditModal] = React.useState(null);
   const [editForm, setEditForm] = React.useState({});
   const [allUsers, setAllUsers] = React.useState([]);
+  const [userSearch, setUserSearch] = React.useState('');
 
   // Load users on mount
   React.useEffect(() => {
@@ -80,21 +81,35 @@ export default function TaskGrid() {
     e.stopPropagation();
     
     // Parse recurrence_rule
-    let recurrence = { freq: 'once', interval: 1, byday: [], bymonthday: [], type: 'repeat' };
+    let recurrence = { freq: 'once', interval: 1, byday: [], bymonthday: [], type: 'repeat', count: '', until: '' };
     if (task.recurrence_rule) {
-      const rule = task.recurrence_rule.toLowerCase();
+      const rule = task.recurrence_rule.toUpperCase();
       
-      // Check type (repeat = lặp lại, remind = nhắc lại)
-      if (rule.includes('type:remind')) {
-        recurrence.type = 'remind';
-      }
-      
-      if (rule.includes('daily')) recurrence.freq = 'daily';
-      else if (rule.includes('weekly')) recurrence.freq = 'weekly';
-      else if (rule.includes('monthly')) recurrence.freq = 'monthly';
-      else if (rule.includes('yearly')) recurrence.freq = 'yearly';
-      else if (rule.includes('hourly')) recurrence.freq = 'hourly';
-      else if (rule.includes('minutely')) recurrence.freq = 'minutely';
+      // Parse each part
+      const parts = rule.split(';');
+      parts.forEach(part => {
+        if (part.includes('TYPE:')) {
+          const type = part.split(':')[1];
+          recurrence.type = type.toLowerCase();
+        }
+        else if (part.includes('FREQ=')) {
+          const freq = part.split('=')[1];
+          recurrence.freq = freq.toLowerCase();
+        }
+        else if (part.includes('INTERVAL=')) {
+          recurrence.interval = parseInt(part.split('=')[1]) || 1;
+        }
+        else if (part.includes('BYDAY=')) {
+          const days = part.split('=')[1].split(',');
+          recurrence.byday = days;
+        }
+        else if (part.includes('COUNT=')) {
+          recurrence.count = part.split('=')[1];
+        }
+        else if (part.includes('UNTIL=')) {
+          recurrence.until = part.split('=')[1];
+        }
+      });
     }
     
     setEditForm({
@@ -109,11 +124,31 @@ export default function TaskGrid() {
       recurrence_freq: recurrence.freq,
       recurrence_interval: recurrence.interval,
       recurrence_byday: recurrence.byday,
-      recurrence_count: '',
-      recurrence_until: ''
+      recurrence_count: recurrence.count,
+      recurrence_until: recurrence.until
     });
+    setUserSearch(''); // Reset search
     setEditModal(task);
   };
+
+  const toggleUserSelection = (email) => {
+    const current = editForm.assigned_to || [];
+    const newSelection = current.includes(email)
+      ? current.filter(e => e !== email)
+      : [...current, email];
+    setEditForm({...editForm, assigned_to: newSelection});
+  };
+
+  const removeUser = (email) => {
+    const newSelection = (editForm.assigned_to || []).filter(e => e !== email);
+    setEditForm({...editForm, assigned_to: newSelection});
+  };
+
+  const filteredUsers = allUsers.filter(user => {
+    const searchLower = userSearch.toLowerCase();
+    return user.name.toLowerCase().includes(searchLower) || 
+           user.email.toLowerCase().includes(searchLower);
+  });
 
   const handleEditSubmit = async (e) => {
     e.preventDefault();
@@ -335,6 +370,65 @@ export default function TaskGrid() {
         font-size: 14px;
         box-sizing: border-box;
       }
+      .tg-user-select-container {
+        position: relative;
+        width: 100%;
+      }
+      .tg-user-search {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #d1d5db;
+        border-radius: 8px 8px 0 0;
+        font-size: 14px;
+        box-sizing: border-box;
+      }
+      .tg-user-list {
+        width: 100%;
+        max-height: 200px;
+        overflow-y: auto;
+        border: 1px solid #d1d5db;
+        border-top: none;
+        border-radius: 0 0 8px 8px;
+        background: white;
+      }
+      .tg-user-item {
+        padding: 8px 10px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+      }
+      .tg-user-item:hover {
+        background: #f3f4f6;
+      }
+      .tg-user-item input[type="checkbox"] {
+        cursor: pointer;
+      }
+      .tg-selected-users {
+        padding: 8px;
+        margin-top: 8px;
+        background: #f9fafb;
+        border-radius: 6px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        min-height: 40px;
+      }
+      .tg-user-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 8px;
+        background: #3b82f6;
+        color: white;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+      .tg-user-tag-remove {
+        cursor: pointer;
+        font-weight: bold;
+      }
       .tg-form-textarea {
         width: 100%;
         padding: 10px;
@@ -552,24 +646,61 @@ export default function TaskGrid() {
             React.createElement('div', { 
               style: { fontSize: '11px', color: '#6b7280', marginBottom: '6px' }, 
               key: 'help' 
-            }, 'Giữ Ctrl/Cmd để chọn nhiều người'),
-            React.createElement('select', {
-              className: 'tg-form-select',
-              multiple: true,
-              size: Math.min(allUsers.length, 5),
-              value: editForm.assigned_to || [],
-              onChange: (e) => {
-                const selected = Array.from(e.target.selectedOptions).map(opt => opt.value);
-                setEditForm({...editForm, assigned_to: selected});
-              },
-              style: { minHeight: '100px' },
-              key: 'i'
-            }, allUsers.map(user => 
-              React.createElement('option', { 
-                value: user.email, 
-                key: user.email 
-              }, `${user.name} (${user.email})`)
-            ))
+            }, 'Tìm kiếm và chọn nhiều người cùng lúc'),
+            
+            // Search box
+            React.createElement('div', { className: 'tg-user-select-container', key: 'container' }, [
+              React.createElement('input', {
+                className: 'tg-user-search',
+                type: 'text',
+                placeholder: '🔍 Tìm kiếm theo tên hoặc email...',
+                value: userSearch,
+                onChange: (e) => setUserSearch(e.target.value),
+                key: 'search'
+              }),
+              
+              // User list with checkboxes
+              React.createElement('div', { className: 'tg-user-list', key: 'list' },
+                filteredUsers.map(user => {
+                  const isSelected = (editForm.assigned_to || []).includes(user.email);
+                  return React.createElement('div', {
+                    className: 'tg-user-item',
+                    key: user.email,
+                    onClick: () => toggleUserSelection(user.email)
+                  }, [
+                    React.createElement('input', {
+                      type: 'checkbox',
+                      checked: isSelected,
+                      onChange: () => {},
+                      key: 'check'
+                    }),
+                    React.createElement('span', { key: 'name' }, `${user.name} (${user.email})`)
+                  ]);
+                })
+              )
+            ]),
+            
+            // Selected users tags
+            (editForm.assigned_to && editForm.assigned_to.length > 0) && 
+              React.createElement('div', { className: 'tg-selected-users', key: 'selected' },
+                editForm.assigned_to.map(email => {
+                  const user = allUsers.find(u => u.email === email);
+                  return React.createElement('span', { 
+                    className: 'tg-user-tag', 
+                    key: email 
+                  }, [
+                    React.createElement('span', { key: 'name' }, user ? user.name : email),
+                    React.createElement('span', {
+                      className: 'tg-user-tag-remove',
+                      onClick: (e) => {
+                        e.stopPropagation();
+                        removeUser(email);
+                      },
+                      key: 'remove'
+                    }, '×')
+                  ]);
+                })
+              )
           ]),
           React.createElement('div', { className: 'tg-form-group', key: 'priority' }, [
             React.createElement('label', { className: 'tg-form-label', key: 'l' }, '🎯 Priority'),
