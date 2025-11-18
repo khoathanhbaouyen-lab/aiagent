@@ -30,12 +30,13 @@ from bs4 import BeautifulSoup
 import contextvars
 from datetime import datetime, timedelta # <-- SỬA: Thêm timedelta
 from typing import List, Tuple, Optional, Union
-from pydantic.v1 import BaseModel, Field  # Use v1 compat layer for LangChain
+from pydantic import BaseModel, Field 
 import chainlit as cl
 from chainlit import Image as ClImage
 from chainlit import Video as ClVideo, Text as ClText
 from chainlit import File as ClFile
 from chainlit.types import ThreadDict  # 🔥 V108: Import ThreadDict
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from apscheduler.triggers.interval import IntervalTrigger
 from langchain.tools import tool
@@ -174,13 +175,6 @@ _PGVECTOR_COLLECTION_NAME = "shared_memory"
 _PGVECTOR_TABLE_NAME = "langchain_pg_embedding"
 # Global Scheduler (khởi tạo 1 lần)
 SCHEDULER: Optional[AsyncIOScheduler] = None
-
-# 🚀 NEW: Global Agent Cache (tránh tạo lại agent mỗi tab)
-_AGENT_CACHE = {}  # { "user_email:chat_profile:is_admin": agent_executor }
-
-# 🚀 NEW: DateTime Parse Cache (tránh gọi LLM nhiều lần với cùng input)
-_DATETIME_PARSE_CACHE = {}  # { "query_string": (datetime, timestamp) }
-_DATETIME_CACHE_TTL = 300  # 5 phút
 
 # Import scheduler jobs từ module riêng (tránh lỗi Windows path trong APScheduler)
 # Inject callbacks để tránh circular import
@@ -767,10 +761,6 @@ async def on_chat_resume(thread: dict):
     print(f"🔄 [Chat Resume] Mode: {chat_profile}")
     
     # 4. Lấy quyền admin và tên user
-    user_email = user.identifier.lower()
-    cl.user_session.set("user_email", user_email)
-    cl.user_session.set("user_id_str", user_email)
-    
     try:
         user_db_data = await asyncio.to_thread(get_user_by_email, user.identifier)
         is_admin = (user_db_data and user_db_data.get('is_admin') == 1)
@@ -778,17 +768,6 @@ async def on_chat_resume(thread: dict):
         
         cl.user_session.set("is_admin", is_admin)
         cl.user_session.set("user_name", user_name)
-        
-        # 🚀 Load persistent session
-        session_id = f"persistent_{user_email.replace('@', '_at_').replace('.', '_')}"
-        chat_history = load_chat_history(user_email, session_id)
-        cl.user_session.set("session_id", session_id)
-        cl.user_session.set("chat_history", chat_history)
-        
-        if chat_history:
-            print(f"✅ [Chat Resume] Loaded {len(chat_history)} messages from persistent session")
-        else:
-            print(f"✅ [Chat Resume] New persistent session created")
         print(f"👤 [Chat Resume] User: {user.identifier}, Admin: {is_admin}, Name: {user_name}")
     except Exception as e:
         print(f"❌ [Chat Resume] Lỗi khi lấy user data: {e}")
@@ -2922,152 +2901,7 @@ def list_active_files(vectorstore: Any) -> list[dict]:
 
 
 # =========================================================
-# 🧠 Trích FACT KEY (SỬ DỤNG LLM - TỐI ƯU HÓA)
-# =========================================================
-async def _extract_fact_key_fast(llm: ChatOpenAI, noi_dung: str) -> str:
-    """
-    (🚀 TỐI ƯU HÓA) Chỉ lấy fact_key (danh mục) để phân loại, không cần full fact text.
-    Nhanh hơn 3-5 lần so với _extract_fact_from_llm cũ.
-    
-    Trả về:
-    - "cong_viec" | "gia_dinh" | "ca_nhan" | "du_lich" | "general" (nếu không rõ ràng)
-    """
-    # Prompt ngắn gọn, chỉ hỏi category
-    prompt = f"""Phân loại nội dung sau vào 1 DANH MỤC (category):
-
-Nội dung: "{noi_dung}"
-
-Các danh mục gợi ý:
-- cong_viec: công việc, dự án, họp, báo cáo, deadline, khách hàng
-- gia_dinh: gia đình, con cái, bố mẹ, họ hàng
-- ca_nhan: cá nhân, sức khỏe, học tập, CCCD, hộ chiếu
-- du_lich: du lịch, nghỉ dưỡng, vũng tàu, hạ long
-- tai_chinh: thanh toán, hóa đơn, ngân hàng, tiền
-- mua_sam: mua sắm, đi chợ, mua đồ
-- general: không rõ ràng hoặc không thuộc các loại trên
-
-CHỈ TRẢ VỀ MỘT TỪ (snake_case), KHÔNG GIẢI THÍCH:"""
-    
-    try:
-        resp = await llm.ainvoke(prompt)
-        fact_key = resp.content.strip().lower()
-        
-        # Validate và fallback
-        valid_keys = ["cong_viec", "gia_dinh", "ca_nhan", "du_lich", "tai_chinh", "mua_sam", "general"]
-        if fact_key not in valid_keys:
-            # Nếu LLM trả về không hợp lệ -> dùng general
-            print(f"⚠️ [Fact Key] LLM trả về '{fact_key}', dùng 'general'")
-            fact_key = "general"
-        
-        print(f"✅ [Fact Key] '{noi_dung[:30]}...' -> {fact_key}")
-        return fact_key
-        
-    except Exception as e:
-        print(f"❌ Lỗi _extract_fact_key_fast: {e}. Dùng 'general'")
-        return "general"
-
-
-async def _extract_fact_and_time_combined(llm: ChatOpenAI, noi_dung: str, thoi_gian: str) -> tuple[str, datetime]:
-    """
-    (🚀 SIÊU TỐI ƯU HÓA) Gọi GPT 1 LẦN DUY NHẤT để lấy CẢ fact_key VÀ datetime.
-    Giảm từ 2 GPT calls xuống còn 1 call.
-    
-    Args:
-        llm: ChatOpenAI instance
-        noi_dung: Nội dung nhắc nhở (VD: "Họp với khách hàng ABC")
-        thoi_gian: Thời gian (VD: "10h sáng mai", "2 tiếng nữa")
-    
-    Returns:
-        tuple: (fact_key, datetime_obj)
-        - fact_key: "cong_viec" | "gia_dinh" | "ca_nhan" | "du_lich" | "tai_chinh" | "mua_sam" | "general"
-        - datetime_obj: datetime object đã parse
-    """
-    global _DATETIME_PARSE_CACHE
-    import time
-    
-    # Check cache cho datetime (giữ nguyên logic cache)
-    cache_key = thoi_gian.lower().strip()
-    cached_dt = None
-    if cache_key in _DATETIME_PARSE_CACHE:
-        cached_dt, cached_time = _DATETIME_PARSE_CACHE[cache_key]
-        if (time.time() - cached_time) < _DATETIME_CACHE_TTL:
-            print(f"♻️ [DateTime Cache HIT] '{thoi_gian}'")
-    
-    now_vn = datetime.now(VN_TZ)
-    
-    # Prompt kết hợp: hỏi CẢ category VÀ datetime cùng lúc
-    prompt = f"""Bây giờ là: {now_vn.isoformat()} (múi giờ Asia/Ho_Chi_Minh)
-
-Nhiệm vụ: Phân tích nội dung và thời gian của nhắc nhở, trả về 2 thông tin:
-
-1. CATEGORY (danh mục):
-   - cong_viec: công việc, dự án, họp, báo cáo, deadline, khách hàng
-   - gia_dinh: gia đình, con cái, bố mẹ, họ hàng
-   - ca_nhan: cá nhân, sức khỏe, học tập, CCCD, hộ chiếu
-   - du_lich: du lịch, nghỉ dưỡng, vũng tàu, hạ long
-   - tai_chinh: thanh toán, hóa đơn, ngân hàng, tiền
-   - mua_sam: mua sắm, đi chợ, mua đồ
-   - general: không rõ ràng
-
-2. DATETIME (thời gian ISO 8601 đầy đủ):
-   - Parse thời gian tự nhiên thành ISO format
-   - VD: '2025-11-07T10:00:00+07:00'
-
-Nội dung: "{noi_dung}"
-Thời gian: "{thoi_gian}"
-
-CHỈ TRẢ VỀ 2 DÒNG (không giải thích):
-category: <danh_muc>
-datetime: <iso_string>"""
-
-    try:
-        # Nếu có cache datetime, chỉ cần hỏi category
-        if cached_dt:
-            resp = await llm.ainvoke(f"""Phân loại nội dung sau vào 1 DANH MỤC:
-Nội dung: "{noi_dung}"
-
-Các danh mục: cong_viec, gia_dinh, ca_nhan, du_lich, tai_chinh, mua_sam, general
-CHỈ TRẢ VỀ MỘT TỪ:""")
-            fact_key = resp.content.strip().lower()
-            dt_vn = cached_dt
-        else:
-            # Gọi GPT 1 lần cho cả 2
-            resp = await llm.ainvoke(prompt)
-            lines = resp.content.strip().split('\n')
-            
-            # Parse response
-            fact_key = "general"
-            iso_str = None
-            for line in lines:
-                if line.startswith("category:"):
-                    fact_key = line.split(":", 1)[1].strip().lower()
-                elif line.startswith("datetime:"):
-                    iso_str = line.split(":", 1)[1].strip().strip("`'\"")
-            
-            # Parse datetime
-            if iso_str:
-                dt = dtparser.isoparse(iso_str)
-                dt_vn = dt.astimezone(VN_TZ)
-                # Save to cache
-                _DATETIME_PARSE_CACHE[cache_key] = (dt_vn, time.time())
-            else:
-                dt_vn = now_vn + timedelta(minutes=1)
-        
-        # Validate fact_key
-        valid_keys = ["cong_viec", "gia_dinh", "ca_nhan", "du_lich", "tai_chinh", "mua_sam", "general"]
-        if fact_key not in valid_keys:
-            print(f"⚠️ [Combined] LLM trả về category '{fact_key}', dùng 'general'")
-            fact_key = "general"
-        
-        print(f"✅ [Combined] '{noi_dung[:30]}...' -> category={fact_key}, time={dt_vn.isoformat()}")
-        return fact_key, dt_vn
-        
-    except Exception as e:
-        print(f"❌ Lỗi _extract_fact_and_time_combined: {e}. Dùng fallback")
-        return "general", now_vn + timedelta(minutes=1)
-
-# =========================================================
-# 🧠 Trích FACT (SỬ DỤNG LLM) - (Hàm cũ - giữ lại nếu cần)
+# 🧠 Trích FACT (SỬ DỤNG LLM) - (Hàm mới)
 # =========================================================
 async def _extract_fact_from_llm(llm: ChatOpenAI, noi_dung: str) -> List[str]:
     """
@@ -3619,19 +3453,7 @@ def _get_end_of_day(dt: datetime) -> datetime:
 async def _llm_parse_dt(llm: ChatOpenAI, when_str: str) -> datetime:
     """
     (MỚI) Dùng LLM (GPT) để phân tích thời gian tự nhiên của người dùng.
-    Có cache để tránh gọi LLM nhiều lần với cùng input.
     """
-    global _DATETIME_PARSE_CACHE
-    import time
-    
-    # Check cache
-    cache_key = when_str.lower().strip()
-    if cache_key in _DATETIME_PARSE_CACHE:
-        cached_dt, cached_time = _DATETIME_PARSE_CACHE[cache_key]
-        if (time.time() - cached_time) < _DATETIME_CACHE_TTL:
-            print(f"♻️ [DateTime Cache HIT] '{when_str}'")
-            return cached_dt
-    
     now_vn = datetime.now(VN_TZ)
     prompt = f"""
     Bây giờ là: {now_vn.isoformat()} ( múi giờ Asia/Ho_Chi_Minh)
@@ -3648,14 +3470,8 @@ async def _llm_parse_dt(llm: ChatOpenAI, when_str: str) -> datetime:
         
         # Dùng dtparser để parse chuỗi ISO 8601 mà LLM trả về
         dt = dtparser.isoparse(iso_str)
-        dt_vn = dt.astimezone(VN_TZ)
-        
-        # Save to cache
-        import time
-        _DATETIME_PARSE_CACHE[cache_key] = (dt_vn, time.time())
-        
-        print(f"🔨 [LLM Parse] GPT đã phân tích '{when_str}' -> '{iso_str}'")
-        return dt_vn
+        print(f"[LLM Parse] GPT đã phân tích '{when_str}' -> '{iso_str}'")
+        return dt.astimezone(VN_TZ) # Đảm bảo đúng timezone
         
     except Exception as e:
         print(f"❌ Lỗi _llm_parse_dt: {e}. Trả về 'now + 1 min'")
@@ -3745,7 +3561,7 @@ def _tick_job_sync_impl(user_id_str, text, repeat_job_id): # <-- SỬA: Nhận u
             return
             
         print(f"[Escalation] Tick: Gửi nhắc (sync) cho {user_id_str}")
-        _do_push_impl(user_id_str, text) # <-- SỬA: Gọi trực tiếp _impl để tránh double push
+        _do_push(user_id_str, text) # <-- SỬA: Dùng user_id_str
         
     except Exception as e:
         print(f"[ERROR] _tick_job_sync crashed: {e}")
@@ -3769,7 +3585,7 @@ def _schedule_escalation_after_first_fire(user_id_str: str, noti_text: str, ever
     trigger = IntervalTrigger(seconds=every_sec, timezone=VN_TZ)
     if SCHEDULER:
         SCHEDULER.add_job(
-           scheduler_jobs._tick_job_sync,
+           _tick_job_sync,
             trigger=trigger,
             id=repeat_job_id,
             args=[user_id_str, noti_text, repeat_job_id], # <--- SỬA
@@ -6369,20 +6185,15 @@ async def setup_chat_session(user: cl.User):
         display_name = f"**{user_id_str}**"
     # --- 🚀 KẾT THÚC CẬP NHẬT LỜI CHÀO 🚀 ---
 
-    # --- 1. Khởi tạo Session ID và Lịch sử Chat (PERSISTENT) ---
-    # 🚀 SỬA: Dùng user_email làm session_id để persistent (1 user = 1 thread)
-    session_id = f"persistent_{user_id_str.replace('@', '_at_').replace('.', '_')}"  # e.g., persistent_onsm_at_oshima_vn
-    
-    # Load chat history từ file (nếu có)
-    chat_history = load_chat_history(user_id_str, session_id)
+    # --- 1. Khởi tạo Session ID và Lịch sử Chat ---
+    session_id = f"session_{_timestamp()}"
+    session_id = f"session_{_timestamp()}" # Tạo ID session mới
+    chat_history = []                     # Bắt đầu lịch sử mới
     
     cl.user_session.set("session_id", session_id)
     cl.user_session.set("chat_history", chat_history)
     
-    if chat_history:
-        print(f"✅ [Session] Đã load {len(chat_history)} tin nhắn từ session: {session_id}")
-    else:
-        print(f"✅ [Session] Tạo session mới: {session_id}")
+    print(f"✅ [Session] Đã tạo session_id mới: {session_id}")
     # --- 🚀 KẾT THÚC SỬA LỖI 🚀 ---
 
     # --- 4. Hiển thị danh sách hội thoại CỦA USER ---
@@ -6577,17 +6388,15 @@ async def setup_chat_session(user: cl.User):
             noti_text = (noi_dung_nhac or "").strip()
             if not noti_text: return "❌ Lỗi: Cần nội dung nhắc."
             
-            # 🚀 SIÊU TỐI ƯU: Gọi GPT 1 lần duy nhất cho CẢ fact_key VÀ datetime
-            fact_key, dt_when = await _extract_fact_and_time_combined(llm, noti_text, thoi_gian)
+            facts_list = await _extract_fact_from_llm(llm, noti_text)
             
             # (SỬA LỖI V94) Lấy timestamp 1 lần
             current_timestamp_iso = datetime.now(VN_TZ).isoformat()
             
-            # (SỬA LỖI V94) Metadata chung - THÊM FACT_KEY
+            # (SỬA LỖI V94) Metadata chung
             common_metadata = {
-                "file_type": "text",
-                "timestamp": current_timestamp_iso,
-                "fact_key": fact_key  # 🚀 LƯU FACT_KEY ĐỂ PHÂN LOẠI
+                "file_type": "text", # Giả định là text
+                "timestamp": current_timestamp_iso
             }
 
             repeat_sec = parse_repeat_to_seconds(thoi_gian)
@@ -6596,46 +6405,50 @@ async def setup_chat_session(user: cl.User):
                 job_id = f"reminder-interval-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
-                # 🚀 OPTIMIZATION: Bỏ embeddings (không cần cho reminder)
-                # texts_to_save = [f"[REMINDER_INTERVAL] every={repeat_sec}s | {noti_text} | job_id={job_id}"]
-                # metadatas_to_save = [common_metadata.copy()]
-                # await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
+                texts_to_save = [f"[REMINDER_INTERVAL] every={repeat_sec}s | {noti_text} | job_id={job_id}"] + facts_list
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"🔁 ĐÃ LÊN LỊCH LẶP: '{noti_text}' • mỗi {repeat_sec} giây"
             
             cron = detect_cron_schedule(thoi_gian)
             if cron:
                 job_id = f"reminder-cron-{user_id_str}-{uuid.uuid4().hex[:6]}"
-                SCHEDULER.add_job(scheduler_jobs._do_push, trigger=cron["trigger"], id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
+                SCHEDULER.add_job(_do_push, trigger=cron["trigger"], id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
-                # 🚀 OPTIMIZATION: Bỏ embeddings (không cần cho reminder)
-                # texts_to_save = [f"[REMINDER_CRON] type={cron['type']} | {thoi_gian} | {noti_text} | job_id={job_id}"]
-                # metadatas_to_save = [common_metadata.copy()]
-                # await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
+                texts_to_save = [f"[REMINDER_CRON] type={cron['type']} | {thoi_gian} | {noti_text} | job_id={job_id}"] + facts_list
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"📅 ĐÃ LÊN LỊCH ({cron['type']}): '{noti_text}' • {thoi_gian}"
             
-            # dt_when đã được parse bởi _extract_fact_and_time_combined()
+            if not dt_when:
+                recurrence_rule = "once"
+                dt_when = await parse_when_to_dt(thoi_gian)
+                trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
+            
             if escalate:
                 job_id = f"first-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
-                SCHEDULER.add_job(scheduler_jobs._first_fire_escalation_job, trigger=trigger, id=job_id, args=[user_id_str, noti_text, 5], replace_existing=False, misfire_grace_time=60)
+                SCHEDULER.add_job(_first_fire_escalation_job, trigger=trigger, id=job_id, args=[user_id_str, noti_text, 5], replace_existing=False, misfire_grace_time=60)
                 
-                # 🚀 OPTIMIZATION: Bỏ embeddings
-                # texts_to_save = [f"[REMINDER_ESCALATE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"]
-                # metadatas_to_save = [common_metadata.copy()]
-                # await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
+                texts_to_save = [f"[REMINDER_ESCALATE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"] + facts_list
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"⏰ ĐÃ LÊN LỊCH (Leo thang): '{noti_text}' • lúc {_fmt_dt(dt_when)}"
             else:
                 job_id = f"reminder-{user_id_str}-{uuid.uuid4().hex[:6]}"
                 trigger = DateTrigger(run_date=dt_when, timezone=VN_TZ)
-                SCHEDULER.add_job(scheduler_jobs._do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
+                SCHEDULER.add_job(_do_push, trigger=trigger, id=job_id, args=[user_id_str, noti_text], replace_existing=False, misfire_grace_time=60)
                 
-                # 🚀 OPTIMIZATION: Bỏ embeddings (không cần cho reminder đơn giản)
-                # texts_to_save = [f"[REMINDER_ONCE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"]
-                # metadatas_to_save = [common_metadata.copy()]
-                # await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
+                texts_to_save = [f"[REMINDER_ONCE] when={_fmt_dt(dt_when)} | {noti_text} | job_id={job_id}"] + facts_list
+                # (SỬA LỖI V94) Thêm metadatas
+                metadatas_to_save = [common_metadata.copy() for _ in texts_to_save]
+                await asyncio.to_thread(vectorstore.add_texts, texts=texts_to_save, metadatas=metadatas_to_save)
                 
                 return f"⏰ ĐÃ LÊN LỊCH (1 lần): '{noti_text}' • lúc {_fmt_dt(dt_when)}"
         except Exception as e:
@@ -8501,23 +8314,15 @@ Chỉ trả về 1 số, không giải thích."""
             # PostgreSQL version: scheduler_job_id được lưu trực tiếp qua APScheduler
             # Không cần UPDATE thêm
 
-            # 🚀 OPTIMIZATION: Dùng hàm nhanh lấy fact_key để phân loại
+            # (Logic tạo FACT giữ nguyên)
             try:
-                fact_key = await _extract_fact_key_fast(llm, task_text)
-                # Lưu task với metadata chứa fact_key
-                task_metadata = {
-                    "file_type": "task",
-                    "fact_key": fact_key,
-                    "timestamp": datetime.now(VN_TZ).isoformat()
-                }
-                await asyncio.to_thread(
-                    vectorstore.add_texts, 
-                    texts=[f"[TASK] {task_text}"],
-                    metadatas=[task_metadata]
-                )
-                print(f"[Task] Đã lưu task với fact_key: {fact_key}")
+                facts_list = await _extract_fact_from_llm(llm, task_text)
+                if facts_list:
+                    texts_to_save = [task_text] + facts_list
+                    await asyncio.to_thread(vectorstore.add_texts, texts_to_save)
+                    print(f"[Task] Đã lưu FACT cho task: {task_text}")
             except Exception as e_fact:
-                print(f"⚠️ Lỗi khi lưu fact_key cho task: {e_fact}")
+                print(f"⚠️ Lỗi khi lưu FACT cho task: {e_fact}")
 
             # (Sửa thông báo trả về)
             msg = f"✅ Đã lên lịch công việc: '{task_text}' (Hạn: {_fmt_dt(dt_when)})"
@@ -8927,26 +8732,6 @@ Chỉ trả về 1 số, không giải thích."""
 {admin_rules}
 """ if is_admin else ""
 
-    # === 🚀 CHECK AGENT CACHE TRƯỚC KHI TẠO MỚI ===
-    global _AGENT_CACHE
-    user_email = cl.user_session.get("user_email", "unknown")
-    cache_key = f"{user_email}:{current_mode}:{is_admin}"
-    
-    if cache_key in _AGENT_CACHE:
-        print(f"♻️ [AGENT CACHE HIT] Tái sử dụng agent cho {cache_key}")
-        cl.user_session.set("main_agent", _AGENT_CACHE[cache_key])
-        
-        await cl.Message(
-            content="🧠 **Trợ lý (Hybrid V96) đã sẵn sàng**. Hãy nhập câu hỏi để bắt đầu!"
-        ).send()
-        
-        all_elements = cl.user_session.get("elements", [])
-        cl.user_session.set("elements", all_elements)
-        return  # Kết thúc sớm, không cần tạo mới
-
-    # === TẠO AGENT MỚI (Nếu chưa có trong cache) ===
-    print(f"🔨 [AGENT] Đang tạo agent mới cho {cache_key}...")
-
     # (Đây là Prompt cuối cùng, thực hiện logic 2 bước của bạn)
     system_prompt_text = f"""
 Bạn là một Agent điều phối thông minh.
@@ -9015,10 +8800,9 @@ QUAN TRỌNG: Chỉ gọi tool. KHÔNG trả lời trực tiếp.
         max_iterations=1 # Vẫn chỉ chạy 1 vòng
     )
 
-    # === BƯỚC 4: LƯU AGENT DUY NHẤT VÀO SESSION & CACHE ===
+    # === BƯỚC 4: LƯU AGENT DUY NHẤT VÀO SESSION ===
     cl.user_session.set("main_agent", main_agent_executor)
-    _AGENT_CACHE[cache_key] = main_agent_executor  # 🚀 Cache agent
-    print(f"✅ [HYBRID AGENT] Đã tạo và cache agent cho {cache_key}")
+    print("✅ [HYBRID AGENT] Đã tạo 1 Agent duy nhất (1 LLM Call) theo logic 2 bước.")
 
     # (Kết thúc thay thế)
     # ---------------------------------------------------------

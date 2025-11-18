@@ -46,9 +46,6 @@ class FeedbackDict(TypedDict, total=False):
     value: int
     comment: Optional[str]
 
-class DeleteFeedbackDict(TypedDict):
-    id: str
-
 class SQLiteDataLayer(BaseDataLayer):
     """
     Custom Data Layer dùng SQLite để lưu trữ chat history.
@@ -291,13 +288,13 @@ class SQLiteDataLayer(BaseDataLayer):
         thread = await self.get_thread(thread_id)
         return thread["userId"] if thread else ""
     
-    async def delete_feedback(self, feedback: DeleteFeedbackDict):
+    async def delete_feedback(self, feedback_id: str) -> bool:
         """Xóa feedback (không dùng)"""
-        pass
+        return False
     
-    async def upsert_feedback(self, feedback: FeedbackDict):
+    async def upsert_feedback(self, feedback: FeedbackDict) -> str:
         """Lưu feedback (không dùng)"""
-        pass
+        return ""
     
     # =========================================================
     # ABSTRACT METHODS MỚI (Chainlit 2.x+)
@@ -325,10 +322,14 @@ class SQLiteDataLayer(BaseDataLayer):
         """Tạo element (không implement)"""
         pass
     
-    async def delete_element(self, element_id: str):
+    async def delete_element(self, element_id: str, thread_id: Optional[str] = None):
         """Xóa element (không implement)"""
         pass
     
     def build_debug_url(self) -> str:
         """Build debug URL (trả về empty)"""
         return ""
+
+    async def close(self) -> None:
+        """Close open resources (no-op for per-request SQLite connections)."""
+        return None

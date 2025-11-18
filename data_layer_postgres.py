@@ -476,3 +476,10 @@ class PostgreSQLDataLayer(BaseDataLayer):
         Returns empty string as PostgreSQL doesn't have a web UI.
         """
         return ""
+    
+    async def close(self):
+        """
+        Close the data layer connection.
+        Required by Chainlit 2.3+.
+        """
+        pass

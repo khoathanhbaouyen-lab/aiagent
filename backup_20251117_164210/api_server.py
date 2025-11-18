@@ -2,7 +2,7 @@
 # Mini HTTP API Server để xử lý DELETE/EDIT từ CustomElements
 # Chạy song song với Chainlit trên port config từ .env
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import sqlite3
@@ -26,13 +26,6 @@ API_SERVER_PORT = int(os.getenv("API_SERVER_PORT", "8001"))
 # APScheduler instance
 SCHEDULER = None
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
-
-# 🔥 NEW: Serve Firebase Service Worker from root path
-@app.route('/firebase-messaging-sw.js')
-def serve_firebase_sw():
-    """Serve Firebase Service Worker với đúng MIME type"""
-    public_dir = os.path.join(BASE_DIR, 'public')
-    return send_from_directory(public_dir, 'firebase-messaging-sw.js', mimetype='application/javascript')
 
 def init_scheduler():
     """Khởi tạo scheduler nếu chưa có"""

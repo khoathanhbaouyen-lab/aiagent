@@ -7,17 +7,13 @@
   
   async function initFirebase() {
     try {
-      // Register Service Worker first
-      if ('serviceWorker' in navigator) {
-        try {
-          const registration = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
-          LOG('✅ Service Worker registered:', registration);
-        } catch (swError) {
-          LOG('⚠️ Service Worker registration failed:', swError);
-          // Continue anyway - FCM might still work for foreground messages
-        }
+      // Check if Firebase is available
+      if (typeof firebase === 'undefined') {
+        LOG('⚠️ Firebase SDK not loaded');
+        return;
       }
-      
+
+      // Firebase config
       const firebaseConfig = {
         apiKey: "AIzaSyARg7fu-yQ2wd5p8LVUp40hvTpa17KJIQ0",
         authDomain: "ai-agent-e4e73.firebaseapp.com",
@@ -27,64 +23,52 @@
         appId: "1:813633792094:web:05c355ec8305f27a09accf",
         measurementId: "G-LSPCQP2PQY"
       };
-      
-      // Import Firebase (dynamically)
-      if (!window.firebase) {
-        await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js');
-        await import('https://www.gstatic.com/firebasejs/10.7.1/firebase-messaging-compat.js');
-      }
-      
+
+      // Initialize Firebase
       if (!firebase.apps.length) {
         firebase.initializeApp(firebaseConfig);
+        LOG('✅ Firebase initialized');
       }
-      
+
+      // Get messaging
       const messaging = firebase.messaging();
-      
-      // Request permission and get token
-      const permission = await Notification.requestPermission();
-      if (permission === 'granted') {
-        fcmToken = await messaging.getToken({
-          vapidKey: 'BK8Qq18QTByMBbOXIel-5s6jX7fwooJotMuTBKEeqoRo-xwDeMptzXQfI-n9Sy54v0QvKS4EkGB3xO0pur3IUF4'
-        });
-        LOG('FCM Token:', fcmToken);
-        
-        // For now, use 'default@local' as user_email since we don't have cross-domain auth
-        // TODO: Implement proper auth token passing from Chainlit to API server
-        const userEmail = 'default@local';
-        
-        // Send token to backend (API server on port 8001)
-        try {
-          const response = await fetch('http://localhost:8001/api/register-fcm-token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              token: fcmToken,
-              user_email: userEmail
-            })
-          });
-          
-          if (response.ok) {
-            LOG('✅ FCM token registered with backend for', userEmail);
-          } else {
-            const errorText = await response.text();
-            LOG('⚠️ Failed to register FCM token:', errorText);
-          }
-        } catch (error) {
-          LOG('❌ Error registering FCM token:', error);
-        }
-      }
-      
-      // Handle foreground messages
+
+      // Handle foreground messages (works without token registration)
       messaging.onMessage((payload) => {
-        LOG('📩 Foreground message:', payload);
+        LOG('📥 Foreground FCM message:', payload);
         const title = payload.notification?.title || '⏰ Nhắc việc';
         const body = payload.notification?.body || '';
         notify(title, body);
       });
-      
-    } catch (error) {
-      LOG('⚠️ Firebase init error:', error);
-      LOG('Falling back to browser notifications only');
+
+      // Optional: Try to get FCM token (requires VAPID key and user permission)
+      try {
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted') {
+          const token = await messaging.getToken({ 
+            vapidKey: 'BK8Qgt18QTByMBbDXIel-5s6jX7fwooJotMuTBKEeqoRo-xwDeM-ptzXQfl-n9Sy54vOOvK54EkGB3xOQpur3luF4'
+          });
+          fcmToken = token;
+          LOG('✅ FCM Token:', token);
+          
+          // Send token to server
+          try {
+            await fetch('/register_fcm_token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token })
+            });
+            LOG('✅ FCM token registered with server');
+          } catch (registerErr) {
+            LOG('⚠️ Failed to register token with server:', registerErr.message);
+          }
+        }
+      } catch (tokenErr) {
+        LOG('⚠️ FCM token registration failed:', tokenErr.message);
+      }
+    } catch (e) {
+      LOG('⚠️ Firebase init error:', e.message);
+      // Don't block app if Firebase fails - browser notifications still work
     }
   }
 
@@ -242,23 +226,24 @@ function fireIfReminder(fullText) {
   if (!fullText) return;
 
   // DEBUG: Log ALL text để debug
-  LOG("🔍 Checking text:", fullText.substring(0, 200));
+  console.log("🔍 [notify.js] Checking text:", fullText.substring(0, 200));
 
   // Chỉ bắn khi có "đến giờ" hoặc "⏰"
   const tnorm = (fullText || "").toLowerCase().replace(/\s+/g, " ").trim();
-  LOG("🔍 Normalized:", tnorm.substring(0, 150));
+  console.log("🔍 [notify.js] Normalized:", tnorm.substring(0, 150));
   
   // Check có "đến giờ", "đến hạn" HOẶC có emoji ⏰
   const hasPattern = /đến\s*(giờ|hạn)/.test(tnorm);  // Match cả "đến giờ" và "đến hạn"
   const hasEmoji = fullText.includes("⏰");
   const hasTask = tnorm.includes("công việc") || tnorm.includes("cong viec");
-  LOG("🔍 Regex test:", hasPattern, "| Emoji test:", hasEmoji, "| Task:", hasTask);
+  console.log("🔍 [notify.js] Regex test:", hasPattern, "| Emoji test:", hasEmoji, "| Task:", hasTask);
   
   if (!hasPattern && !hasEmoji && !hasTask) {
-    LOG("❌ Not a reminder/task, skipping");
+    console.log("❌ [notify.js] Not a reminder/task, skipping");
     return;
   }
   
+  console.log("✅ [notify.js] IS A REMINDER! Processing...");
   LOG("✅ IS A REMINDER! Processing...");
 
   // 1) Lấy task sau “ĐÃ ĐẾN GIỜ:”
