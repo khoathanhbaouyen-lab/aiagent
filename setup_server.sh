@@ -86,13 +86,26 @@ echo "   Password: oshima_pass_2024"
 # 6. Create Python virtual environment
 echo "🐍 [6/7] Creating Python virtual environment..."
 cd "${PROJECT_DIR}"
-python3.11 -m venv .venv311
-source .venv311/bin/activate
 
-# 7. Install Python dependencies
+# Tạo venv nếu chưa có
+if [ ! -d ".venv311" ]; then
+    python3.11 -m venv .venv311
+    echo "✅ Virtual environment created"
+else
+    echo "ℹ️ Virtual environment already exists"
+fi
+
+# Activate venv và đảm bảo nó được giữ trong toàn bộ script
+source .venv311/bin/activate
+echo "✅ Virtual environment activated: $VIRTUAL_ENV"
+
+# 7. Install Python dependencies (trong venv)
 echo "📚 [7/7] Installing Python packages..."
+# Đảm bảo đang dùng pip từ venv
+which pip
 pip install --upgrade pip
 pip install -r requirements.txt
+echo "✅ Python packages installed in venv"
 
 # 8. Create .env file if not exists
 echo "⚙️ Creating .env file..."
@@ -139,9 +152,15 @@ mkdir -p memory memory_db saved_files saved_images sessions
 mkdir -p public/files public/elements
 mkdir -p user_data vector_db ui_inbox users
 
-# 10. Initialize database tables
+# 10. Initialize database tables (phải chạy trong venv)
 echo "🗄️ Initializing database tables..."
-python3 << 'PYEOF'
+# Đảm bảo đang trong venv
+if [ -z "$VIRTUAL_ENV" ]; then
+    source .venv311/bin/activate
+fi
+
+# Sử dụng python từ venv
+python << 'PYEOF'
 import os
 import sys
 sys.path.insert(0, os.getcwd())
